@@ -110,6 +110,16 @@ class Attack(Base, BaseMixin):
     category: Mapped[str] = mapped_column(String(100), index=True)
     prompt_text: Mapped[str] = mapped_column(Text, nullable=False)
     embedding = mapped_column(Vector(1536), nullable=True)
+    # Mutation lineage: root attacks have NULL; specialised variants point at the
+    # attack they evolved from. round_number records which campaign round the
+    # attack was created in (mutations keep their parent's round).
+    parent_attack_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("attacks.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
+    )
+    round_number: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )

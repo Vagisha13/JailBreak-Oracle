@@ -187,3 +187,21 @@ cd backend && ASYNC=... SYNC=sqlite:///./_migration_check.db alembic upgrade hea
 ```
 
 Still open (intentional): docker-compose app stack (`backend`/`worker`/`frontend` services + README) — scheduled with the container-phase; `AgentRun` telemetry wiring; budget enforcement (Phase 8).
+
+---
+
+## 10. Phase 3 — Feedback-driven mutation engine (2026-09-06)
+
+**69/69 tests pass.** Lint + typecheck gates green.
+
+| Phase 0 issue | Resolution |
+|---|---|
+| E-07 (High) | Mutation hints were written but never read. New `app/agents/attacker.py::generate_mutated_attack` + `app/services/mutation.py::MutationEngine` consume evaluator feedback (category/reasoning/severity/confidence), optionally the target's actual response and verifier result, and generate a genuinely evolved prompt. |
+| E-06 (High) | Orchestrator PLAN is now feedback-driven (`strategy_scores` + `_select_strategy`: explore untried / exploit best-scoring). The MUTATE step actually executes: blocked attempts on mutation-capable strategies trigger a retry against an evolved prompt (bounded to `attack_budget // 2`), eliminating the old `strategy_shift` hint block. |
+| E-08 (High) | `AdaptiveMutationStrategy` and `MultiTurnStrategy` now implement `supports_mutation` + `get_mutation_prompt()`. Adaptive mutation rewrites the prompt using evaluator reasoning; multi-turn produces the genuine NEXT turn escalated against the target's prior response. Static strategies remain single-shot. |
+| Lineage + dedup | `attacks` gains `parent_attack_id` (self-FK) and `round_number` via migration `c3e1a9d8b2f7_attack_lineage` (SQLite-safe batch mode; upgrade/downgrade round-trip verified). Every mutation rows an `attack_mutations` record (`mutation_type`, `mutated_prompt`). Dedup: normalized-prompt set over the experiment's recent 50 attacks skips near-identical repeats so budget isn't burned re-firing the same payload. |
+| API | `/campaigns/{id}/attacks` now returns `parent_attack_id`, `round_number`, and `mutation_type`. |
+
+New tests: `tests/test_mutation.py` (5) — lineage persistence, dedup, adaptive/multi-turn prompt construction, and a full campaign-loop RETRY integration test (blocked primary → feedback mutation → confirmed jailbreak).
+
+Architecture notes: orchestrator stores `MutationEngine` internally (from the attacker agent) so both router and worker paths get it automatically; verifier feedback is wired into `AttackFeedback.verifier_result` for future false-positive steering.

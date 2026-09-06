@@ -4,11 +4,7 @@ from datetime import datetime, timezone
 from sqlalchemy.future import select
 
 from app.db.session import AsyncSessionLocal
-from app.models.domain import (
-    Experiment,
-    Target,
-    AttackMutation,
-)
+from app.models.domain import Experiment, Target
 from app.schemas.campaign import CampaignConfig, CampaignSummary
 from app.agents.attacker import AttackerAgent
 from app.agents.evaluator import EvaluatorAgent
@@ -18,6 +14,8 @@ from app.services.evaluation import EvaluationService
 from app.services.verification import VerificationService
 from app.services.memory import MemoryService
 from app.strategies.registry import get_strategy, list_strategies
+from app.schemas.feedback import AttackFeedback
+from app.services.mutation import MutationEngine
 from app.core.logging import get_logger
 
 logger = get_logger("campaign")
@@ -47,6 +45,7 @@ class CampaignOrchestrator:
         self.verification_service = (
             VerificationService(verifier_agent) if verifier_agent else None
         )
+        self.mutation_engine = MutationEngine(attacker_agent)
 
     async def initialize_experiment(
         self,
@@ -130,26 +129,20 @@ class CampaignOrchestrator:
             # 3. Get available strategies
             available_strategies = list_strategies()
 
+            # Feedback-driven planning state: score strategies by observed success.
+            strategy_scores: dict[str, float] = {}
+            # Mutations are costly LLM calls — cap them to avoid runaway spend.
+            mutation_budget = max(1, (config.attack_budget or 1) // 2)
+            mutation_attempts = 0
+
             for round_num in range(1, config.max_rounds + 1):
                 rounds_executed = round_num
 
-                # PLAN: Select strategy based on exploration/exploitation ratio
-                import random
-                if (
-                    random.random() < config.exploration_ratio
-                    or len(strategies_used) < len(available_strategies)
-                ):
-                    # Explore: try a new strategy
-                    unused = [s for s in available_strategies if s not in strategies_used]
-                    if unused:
-                        strategy_name = random.choice(unused)
-                    else:
-                        strategy_name = random.choice(available_strategies)
-                else:
-                    # Exploit: pick a strategy that has worked before
-                    strategy_name = random.choice(available_strategies)
-
-                strategy = get_strategy(strategy_name)
+                # PLAN: explore new strategies vs. exploit the best-scoring one.
+                strategy = self._select_strategy(
+                    config, available_strategies, strategies_used, strategy_scores
+                )
+                strategy_name = strategy.name
                 strategies_used.add(strategy_name)
 
                 # ATTACK: Generate adversarial prompt
@@ -204,6 +197,7 @@ class CampaignOrchestrator:
                 if eval_summary.verdict.is_jailbreak:
                     vulnerabilities_found += 1
                     consecutive_failures = 0
+                    strategy_scores[strategy_name] = strategy_scores.get(strategy_name, 0.0) + 1.0
 
                     # VERIFY: Independent confirmation
                     if self.verification_service and eval_summary.vulnerability_id:
@@ -219,29 +213,64 @@ class CampaignOrchestrator:
                 else:
                     consecutive_failures += 1
 
-                    # MUTATE: If strategy failing repeatedly, note it
-                    if consecutive_failures >= 3:
-                        # Record mutation hint for next iteration
-                        async with AsyncSessionLocal() as session:
-                            mutation = AttackMutation(
-                                attack_id=attack.id,
-                                mutation_type="strategy_shift",
-                                mutated_prompt=(
-                                    f"Strategy '{strategy_name}' failed {consecutive_failures} times consecutively. "
-                                    f"Consider switching approach."
-                                ),
-                            )
-                            session.add(mutation)
-                            await session.commit()
-                        logger.warning(
-                            "Strategy mutation hint recorded",
-                            extra={
-                                "event_name": "campaign.mutation_recorded",
-                                "campaign_id": str(config.experiment_id),
-                                "strategy": strategy_name,
-                                "iteration": round_num,
-                            },
+                    # MUTATE + RETRY: evolve the blocked prompt using feedback.
+                    if (
+                        strategy.supports_mutation
+                        and mutation_attempts < mutation_budget
+                    ):
+                        feedback = AttackFeedback(
+                            attack_id=attack.id,
+                            prompt_text=attack.prompt_text,
+                            target_response=exec_summary.target_response or "",
+                            is_jailbreak=False,
+                            severity=eval_summary.verdict.severity,
+                            category=eval_summary.verdict.category,
+                            confidence=eval_summary.verdict.confidence,
+                            reasoning=eval_summary.verdict.reasoning,
+                            mutation_type=strategy_name,
                         )
+                        last_attack = {
+                            "id": attack.id,
+                            "prompt_text": attack.prompt_text,
+                            "strategy_name": attack.strategy_name,
+                        }
+                        mutated = await self.mutation_engine.mutate(
+                            strategy=strategy,
+                            objective=config.objective,
+                            experiment_id=config.experiment_id,
+                            last_attack=last_attack,
+                            feedback=feedback,
+                            round_number=round_num,
+                        )
+                        mutation_attempts += 1
+
+                        if mutated:
+                            mutated_exec = await self.execution_service.execute_attack(
+                                attack_id=mutated.id,
+                                target_id=config.target_id,
+                            )
+                            mutated_eval = await self.evaluation_service.evaluate_result(
+                                result_id=mutated_exec.attack_result_id,
+                                attack_objective=config.objective,
+                            )
+                            if mutated_eval.verdict.is_jailbreak:
+                                vulnerabilities_found += 1
+                                consecutive_failures = 0
+                                strategy_scores[strategy_name] = (
+                                    strategy_scores.get(strategy_name, 0.0) + 1.0
+                                )
+                                if (
+                                    self.verification_service
+                                    and mutated_eval.vulnerability_id
+                                ):
+                                    try:
+                                        await self.verification_service.verify_vulnerability(
+                                            mutated_eval.vulnerability_id
+                                        )
+                                    except Exception:
+                                        pass
+                                if config.stop_on_first_success:
+                                    break
 
             # Mark campaign as COMPLETED
             await self._update_experiment_status(config.experiment_id, "COMPLETED")
@@ -284,6 +313,31 @@ class CampaignOrchestrator:
                 status="FAILED",
                 error=str(exc),
             )
+
+    @staticmethod
+    def _select_strategy(
+        config: CampaignConfig,
+        available_strategies: list[str],
+        strategies_used: set[str],
+        strategy_scores: dict[str, float],
+    ):
+        """Feedback-driven PLAN: explore new strategies or exploit the best."""
+        import random
+
+        untried = [s for s in available_strategies if s not in strategies_used]
+        known_good = [s for s in strategy_scores if strategy_scores[s] > 0]
+
+        exploring = random.random() < config.exploration_ratio or (
+            bool(untried) and len(strategies_used) < len(available_strategies)
+        )
+
+        if exploring and untried:
+            return get_strategy(random.choice(untried))
+        if known_good:
+            # Exploit: pick the strategy that has performed best so far.
+            best = max(known_good, key=lambda s: strategy_scores[s])
+            return get_strategy(best)
+        return get_strategy(random.choice(available_strategies))
 
     async def _update_experiment_status(
         self, experiment_id: uuid.UUID, status: str

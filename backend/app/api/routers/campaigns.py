@@ -8,7 +8,16 @@ from sqlalchemy import func
 from app.core.auth import get_current_user
 from app.core.logging import get_logger
 from app.db.session import AsyncSessionLocal
-from app.models.domain import User, Project, Target, Experiment, Vulnerability, Attack, AttackResult
+from app.models.domain import (
+    User,
+    Project,
+    Target,
+    Experiment,
+    Vulnerability,
+    Attack,
+    AttackResult,
+    AttackMutation,
+)
 from app.schemas.campaign import CampaignStartRequest, CampaignResponse
 from app.services.factory import build_campaign_orchestrator
 from app.services.campaign import CampaignOrchestrator
@@ -158,6 +167,20 @@ async def get_campaign_attacks(
         )
         attacks = (await session.execute(stmt)).scalars().all()
         results = []
+
+        # Build attack_id -> mutation metadata map (for mutation_type attribution).
+        mutation_stmt = (
+            select(AttackMutation)
+            .where(
+                AttackMutation.attack_id.in_([a.id for a in attacks])
+            )
+        )
+        mutations_map: dict[str, dict] = {}
+        for mutation in (await session.execute(mutation_stmt)).scalars().all():
+            mutations_map[str(mutation.attack_id)] = {
+                "mutation_type": mutation.mutation_type
+            }
+
         for attack in attacks:
             result_stmt = select(AttackResult).where(AttackResult.attack_id == attack.id)
             attack_result = (await session.execute(result_stmt)).scalars().first()
@@ -171,12 +194,17 @@ async def get_campaign_attacks(
                     "strategy_name": attack.strategy_name,
                     "category": attack.category,
                     "prompt_text": attack.prompt_text,
+                    "parent_attack_id": str(attack.parent_attack_id) if attack.parent_attack_id else None,
+                    "round_number": attack.round_number,
                     "created_at": attack.created_at.isoformat() if attack.created_at else None,
                     "target_response": attack_result.target_response if attack_result else None,
                     "latency_ms": attack_result.latency_ms if attack_result else None,
                     "is_jailbreak": vuln is not None,
                     "severity": vuln.severity if vuln else None,
                     "verified_status": vuln.verified_status if vuln else None,
+                    "mutation_type": (
+                        mutations_map.get(str(attack.id), {}).get("mutation_type")
+                    ),
                 }
             )
         return results
