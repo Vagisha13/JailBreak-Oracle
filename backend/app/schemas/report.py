@@ -42,3 +42,26 @@ class RedTeamReport(BaseModel):
     strategy_performance: List[StrategyPerformance]
     top_vulnerabilities: List[VulnerabilitySummaryItem]
     remediation_summary: List[str]
+
+
+class DefenseReport(BaseModel):
+    """Structured output of the Defender agent duty-cycle (E-11)."""
+
+    experiment_id: uuid.UUID
+    experiment_name: str
+    target_name: str
+    generated_at: datetime
+    overall_assessment: str
+    regression_score: float = Field(
+        ...,
+        ge=0.0,
+        le=100.0,
+        description=(
+            "0-100 predicted probability confirmed attack classes still "
+            "succeed post-remediation"
+        ),
+    )
+    recommendations: List[str] = Field(..., min_length=1)
+    is_fallback: bool = Field(
+        ..., description="True when produced by the rule-based fallback instead of the LLM"
+    )

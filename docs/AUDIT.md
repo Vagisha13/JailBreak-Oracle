@@ -249,3 +249,18 @@ New tests: `tests/test_memory_honest.py` (6) — relevance-not-recency ranking, 
 | Agreement | Orchestrator records evaluator↔verifier agreement in verifier `AgentRun` telemetry (`verified_status` + `agreement`) and emits a structured `verification.agreement` event on every confirmed path (primary + mutated). |
 
 New tests: `tests/test_structured_outputs.py` (8) — verdict derivation both ways, `AMBIGUOUS` semantics, severity/confidence constraint rejection, structured evaluator prompt, verifier independence (prompt must not contain evaluator reasoning), disposition→status mapping, persisted verifier fields, and `INCONCLUSIVE` persistence. Migration round-trip verified on a fresh SQLite DB.
+
+---
+
+## 14. Phase 7 — Defender agent, remediation & regression scores (2026-09-06)
+
+**99/99 tests pass.** Lint + typecheck gates green.
+
+| Issue | Resolution |
+|---|---|
+| E-11 (hardcoded remediation) | `ReportService` no longer emits the 3 canned strings. The base report's `remediation_summary` is now **evidence-derived** from the actual findings (`_derive_remediation_summary`: per-category lines sorted by top severity, noting verified count; honest "no findings" message when empty). |
+| E-11 (no Defender agent) | New `DefenderAgent` (`app/agents/defender.py`) duty-cycles on campaign findings. `DefenderVerdict` is strictly typed: `recommendations` (min 1), `regression_score` (`ge=0.0/le=100.0`, predicted probability confirmed attack classes still succeed after mitigation), `overall_assessment`, and an honesty flag `is_fallback`. The LLM prompt presents severity breakdown, findings, and observed strategies and demands schema-conformant JSON. |
+| E-11 (honest AI vs fallback) | When no provider is configured, the provider errors, or the output is unparseable/out-of-range, the agent degrades to a documented deterministic fallback: recommendations built from the **verifier's own `remediation_guidance`** (deduped, highest severity/confidence first) plus category-derived lines, and a weighted `regression_score` (CRITICAL 40 · HIGH 25 · MEDIUM 12 · LOW 5 × confidence, capped 100). `is_fallback=True` is surfaced in the API response and a `defender.fallback` structured event is logged — the client is never presented with LLM output that was actually rule-based. |
+| E-11 (no endpoint) | `POST /api/v1/reports/experiment/{id}/defense` returns a structured `DefenseReport` (recommendations, regression score, assessment, `is_fallback`) after owner 403/404 checks. Wired via `DEFENDER_PROVIDER`/`DEFENDER_MODEL` settings through the shared `TargetFactory` (mock-safe in CI via the tests' provider fixture). |
+
+New tests: `tests/test_defender.py` (12) — LLM JSON parsing, fallback on no-provider/provider-error/invalid-JSON/out-of-range-regression, empty-context handling, weighted regression score math (CRITICAL 40·1.0 + HIGH 25·0.9 = 62.5), service-level LLM + fallback paths (verifier guidance surfaced), unknown-experiment 404, API 200 with dependency override, and cross-owner 403.

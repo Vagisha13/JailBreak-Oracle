@@ -1,10 +1,18 @@
 import uuid
 from datetime import datetime, timezone
-from typing import List, Dict
+from typing import Dict, List
+
 from sqlalchemy.future import select
 from app.db.session import AsyncSessionLocal
+from app.agents.defender import (
+    DefenseContext,
+    DefenseContextItem,
+    DefenderAgent,
+    DefenderVerdict,
+)
 from app.models.domain import Experiment, Target, Attack, Vulnerability
 from app.schemas.report import (
+    DefenseReport,
     RedTeamReport,
     SeverityBreakdown,
     StrategyPerformance,
@@ -13,6 +21,8 @@ from app.schemas.report import (
 from app.core.logging import get_logger
 
 logger = get_logger("report")
+
+_SEVERITY_ORDER = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
 
 class ReportService:
@@ -114,11 +124,10 @@ class ReportService:
             )
             risk_score = self.calculate_risk_score(sev_counts, total_attacks)
 
-            remediation_summary = [
-                "Implement strict systemic delimitation between instructions and context inputs.",
-                "Deploy input pre-filtering classifiers for prompt injection detection.",
-                "Enforce output guardrails to suppress sensitive text exfiltration.",
-            ]
+            # Evidence-derived remediation summary (E-11): built from the actual
+            # findings instead of hardcoded guidance strings, so the report never
+            # presents a canned list as "AI defense guidance".
+            remediation_summary = self._derive_remediation_summary(vulns)
 
             logger.info(
                 "Report generated",
@@ -148,3 +157,118 @@ class ReportService:
                 top_vulnerabilities=top_vulns,
                 remediation_summary=remediation_summary,
             )
+
+    def _derive_remediation_summary(
+        self, vulns: List[Vulnerability]
+    ) -> List[str]:
+        """Build an evidence-derived remediation summary from real findings (E-11)."""
+        if not vulns:
+            return [
+                "No vulnerabilities were confirmed; maintain current input/output "
+                "guardrails and continue monitoring."
+            ]
+
+        by_category: Dict[str, list] = {}
+        for v in vulns:
+            category = v.category or "uncategorized"
+            by_category.setdefault(category, []).append(v)
+
+        summary: List[str] = []
+        for category, items in sorted(
+            by_category.items(),
+            key=lambda pair: max(
+                _SEVERITY_ORDER.get(i.severity.upper(), 0) for i in pair[1]
+            ),
+            reverse=True,
+        ):
+            max_sev = max(
+                _SEVERITY_ORDER.get(i.severity.upper(), 0) for i in items
+            )
+            sev_label = next(
+                (s for s, rank in _SEVERITY_ORDER.items() if rank == max_sev), "LOW"
+            )
+            verified = sum(
+                1 for i in items if i.verified_status == "CONFIRMED_VULNERABILITY"
+            )
+            summary.append(
+                f"Tighten guardrails for '{category}': {len(items)} finding(s) "
+                f"(top severity {sev_label}, {verified} verified)."
+            )
+        return summary
+
+    async def generate_defense_report(
+        self, experiment_id: uuid.UUID, defender_agent: DefenderAgent
+    ) -> DefenseReport:
+        """Duty-cycle the Defender agent to produce remediation guidance (E-11)."""
+        async with AsyncSessionLocal() as session:
+            exp_stmt = select(Experiment).where(Experiment.id == experiment_id)
+            exp = (await session.execute(exp_stmt)).scalars().first()
+            if not exp:
+                raise ValueError(f"Experiment with ID {experiment_id} not found.")
+
+            target_stmt = select(Target).where(Target.id == exp.target_id)
+            target = (await session.execute(target_stmt)).scalars().first()
+
+            vulns_stmt = select(Vulnerability).where(
+                Vulnerability.experiment_id == experiment_id
+            )
+            vulns = (await session.execute(vulns_stmt)).scalars().all()
+
+            attacks_stmt = select(Attack).where(
+                Attack.experiment_id == experiment_id
+            )
+            attacks = (await session.execute(attacks_stmt)).scalars().all()
+
+            sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+            for v in vulns:
+                sev_upper = v.severity.upper() if v.severity else "LOW"
+                if sev_upper in sev_counts:
+                    sev_counts[sev_upper] += 1
+
+            sorted_vulns = sorted(
+                vulns,
+                key=lambda v: _SEVERITY_ORDER.get(v.severity.upper(), 0),
+                reverse=True,
+            )
+            context = DefenseContext(
+                experiment_id=experiment_id,
+                target_name=target.name if target else "Unknown Target",
+                severity_breakdown=sev_counts,
+                top_vulnerabilities=[
+                    DefenseContextItem(
+                        category=v.category or "uncategorized",
+                        severity=v.severity or "LOW",
+                        confidence=v.confidence,
+                        verified_status=v.verified_status,
+                        remediation_guidance=v.remediation_guidance,
+                    )
+                    for v in sorted_vulns
+                ],
+                strategies_used=[
+                    a.strategy_name
+                    for a in attacks
+                    if a.strategy_name
+                ],
+            )
+
+        verdict: DefenderVerdict = await defender_agent.generate(context)
+
+        logger.info(
+            "Defense report generated",
+            extra={
+                "event_name": "defense_report.generated",
+                "experiment_id": str(experiment_id),
+                "is_fallback": verdict.is_fallback,
+                "regression_score": verdict.regression_score,
+            },
+        )
+        return DefenseReport(
+            experiment_id=experiment_id,
+            experiment_name=exp.name,
+            target_name=context.target_name,
+            generated_at=verdict.generated_at,
+            overall_assessment=verdict.overall_assessment,
+            regression_score=verdict.regression_score,
+            recommendations=verdict.recommendations,
+            is_fallback=verdict.is_fallback,
+        )

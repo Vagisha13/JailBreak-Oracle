@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     VERIFIER_PROVIDER: str = "litellm"
     VERIFIER_MODEL: str = "gpt-4o-mini"
 
+    # Defender agent — generates remediation guidance + regression scores
+    DEFENDER_PROVIDER: str = "litellm"
+    DEFENDER_MODEL: str = "gpt-4o-mini"
+
     # Default target model (overridden per-campaign)
     DEFAULT_TARGET_PROVIDER: str = "litellm"
     DEFAULT_TARGET_MODEL: str = "gpt-4o-mini"

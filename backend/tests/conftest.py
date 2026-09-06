@@ -123,6 +123,7 @@ def mock_llm_providers(monkeypatch):
         "ATTACKER_PROVIDER",
         "EVALUATOR_PROVIDER",
         "VERIFIER_PROVIDER",
+        "DEFENDER_PROVIDER",
         "DEFAULT_TARGET_PROVIDER",
     ):
         monkeypatch.setattr(settings, attr, "mock")
