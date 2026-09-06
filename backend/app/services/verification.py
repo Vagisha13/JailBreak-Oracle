@@ -59,6 +59,7 @@ class VerificationService:
             vuln.verification_reasoning = verdict.reasoning
             vuln.remediation_guidance = verdict.remediation_guidance
             vuln.verifier_confidence = verdict.confidence
+            vuln.verifier_evidence = verdict.evidence or None
             vuln.verified_at = now
             await session.commit()
             await session.refresh(vuln)

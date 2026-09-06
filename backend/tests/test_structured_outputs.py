@@ -231,6 +231,8 @@ async def test_verifier_fields_persisted_and_confirmed():
         assert vuln.remediation_guidance == "harden system prompt"
         assert vuln.verifier_confidence == 0.97
         assert vuln.verified_at is not None
+        # structured verdict evidence is persisted (E-21), not folded into prose.
+        assert vuln.verifier_evidence == ["data"]
         # evaluator reasoning is preserved untouched (independent fields).
         assert vuln.reasoning == "evaluator said jailbreak"
 

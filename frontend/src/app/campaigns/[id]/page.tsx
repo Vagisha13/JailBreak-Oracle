@@ -6,15 +6,22 @@ import Link from "next/link";
 import {
   ArrowLeft, Loader2, Clock, Target,
   Activity, Zap, CheckCircle2,
-  XCircle, BarChart3,
+  XCircle, BarChart3, ClipboardList, CircleAlert,
 } from "lucide-react";
-import { api } from "@/lib/api";
+import {
+  getCampaignFindings,
+  getCampaignStatus,
+  getCampaignAttacks,
+} from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { StatusBadge } from "@/components/StatusBadge";
 import { ErrorState } from "@/components/ErrorState";
 import { EmptyState } from "@/components/EmptyState";
 import { Collapsible } from "@/components/Collapsible";
-import type { CampaignStatus, AttackDetail } from "@/lib/types";
+import { BudgetPanel } from "@/components/campaigns/BudgetPanel";
+import { FindingsView } from "@/components/campaigns/FindingsView";
+import { MutationTree } from "@/components/campaigns/MutationTree";
+import type { CampaignStatus, AttackDetail, Finding } from "@/lib/types";
 
 interface Analytics {
   totalAttacks: number;
@@ -215,9 +222,10 @@ export default function CampaignDetailPage() {
 
   const [status, setStatus] = useState<CampaignStatus | null>(null);
   const [attacks, setAttacks] = useState<AttackDetail[]>([]);
+  const [findings, setFindings] = useState<Finding[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [tab, setTab] = useState<"overview" | "attacks" | "analytics" | "timeline">("overview");
+  const [tab, setTab] = useState<"overview" | "attacks" | "analytics" | "timeline" | "findings">("overview");
 
   useEffect(() => {
     if (!authLoading && !isAuthenticated) router.push("/login");
@@ -225,12 +233,14 @@ export default function CampaignDetailPage() {
 
   const fetchData = useCallback(async () => {
     try {
-      const [statusRes, attacksRes] = await Promise.all([
-        api.get<CampaignStatus>(`/campaigns/${id}/status`),
-        api.get<AttackDetail[]>(`/campaigns/${id}/attacks`),
+      const [statusRes, attacksRes, findingsRes] = await Promise.all([
+        getCampaignStatus(id),
+        getCampaignAttacks(id),
+        getCampaignFindings(id),
       ]);
       setStatus(statusRes.data);
       setAttacks(attacksRes.data);
+      setFindings(findingsRes.data);
       setError("");
     } catch {
       setError("Failed to load campaign data. It may not exist or the backend is unreachable.");
@@ -244,13 +254,15 @@ export default function CampaignDetailPage() {
     let active = true;
     const run = async () => {
       try {
-        const [statusRes, attacksRes] = await Promise.all([
-          api.get<CampaignStatus>(`/campaigns/${id}/status`),
-          api.get<AttackDetail[]>(`/campaigns/${id}/attacks`),
+        const [statusRes, attacksRes, findingsRes] = await Promise.all([
+          getCampaignStatus(id),
+          getCampaignAttacks(id),
+          getCampaignFindings(id),
         ]);
         if (active) {
           setStatus(statusRes.data);
           setAttacks(attacksRes.data);
+          setFindings(findingsRes.data);
           setError("");
         }
       } catch {
@@ -302,6 +314,7 @@ export default function CampaignDetailPage() {
   const tabs = [
     { key: "overview" as const, label: "Overview", icon: Activity },
     { key: "attacks" as const, label: `Attacks (${attacks.length})`, icon: Zap },
+    { key: "findings" as const, label: `Findings (${findings.length})`, icon: ClipboardList },
     { key: "analytics" as const, label: "Analytics", icon: BarChart3 },
     { key: "timeline" as const, label: "Timeline", icon: Clock },
   ];
@@ -322,6 +335,15 @@ export default function CampaignDetailPage() {
                 Live
               </span>
             )}
+            {status.is_stale && (
+              <span className="flex items-center gap-1.5 text-xs text-amber-400">
+                <CircleAlert className="w-3.5 h-3.5" />
+                Stalled &middot; no heartbeat
+              </span>
+            )}
+            {status.resumable && (
+              <span className="text-[10px] font-mono text-slate-500">resumable</span>
+            )}
           </div>
           <p className="text-xs text-slate-500 mt-1 font-mono">{status.experiment_id}</p>
         </div>
@@ -339,6 +361,16 @@ export default function CampaignDetailPage() {
           </div>
         </div>
         <div className="card p-4">
+          <p className="text-[10px] text-slate-500 uppercase tracking-wider">Round</p>
+          <p className="text-xl font-bold text-violet-400 mt-1">{status.current_round}/{status.total_rounds}</p>
+          <div className="mt-2 h-1 bg-slate-800 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-violet-500 rounded-full transition-all"
+              style={{ width: `${Math.min(100, (status.current_round / Math.max(1, status.total_rounds)) * 100)}%` }}
+            />
+          </div>
+        </div>
+        <div className="card p-4">
           <p className="text-[10px] text-slate-500 uppercase tracking-wider">Jailbreaks</p>
           <p className="text-xl font-bold text-red-400 mt-1">{analytics.successfulAttacks}</p>
         </div>
@@ -346,6 +378,9 @@ export default function CampaignDetailPage() {
           <p className="text-[10px] text-slate-500 uppercase tracking-wider">Success Rate</p>
           <p className="text-xl font-bold text-cyan-400 mt-1">{analytics.successRate.toFixed(1)}%</p>
         </div>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div className="card p-4">
           <p className="text-[10px] text-slate-500 uppercase tracking-wider">Started</p>
           <p className="text-sm font-medium text-slate-300 mt-1">
@@ -356,6 +391,16 @@ export default function CampaignDetailPage() {
               Finished: {new Date(status.finished_at).toLocaleString()}
             </p>
           )}
+        </div>
+        <div className="card p-4">
+          <p className="text-[10px] text-slate-500 uppercase tracking-wider">Tokens</p>
+          <p className="text-xl font-bold text-white mt-1">{status.budget.total_tokens.toLocaleString()}</p>
+        </div>
+        <div className="card p-4">
+          <p className="text-[10px] text-slate-500 uppercase tracking-wider">Heartbeat</p>
+          <p className="text-sm font-medium text-slate-300 mt-1">
+            {status.heartbeat_at ? new Date(status.heartbeat_at).toLocaleString() : "-"}
+          </p>
         </div>
       </div>
 
@@ -378,6 +423,7 @@ export default function CampaignDetailPage() {
 
       {tab === "overview" && (
         <div className="space-y-4">
+          <BudgetPanel budget={status.budget} />
           {attacks.length === 0 ? (
             <EmptyState
               message={isRunning ? "Campaign is running. Attacks will appear shortly." : "No attacks were executed in this campaign."}
@@ -493,19 +539,29 @@ export default function CampaignDetailPage() {
 
       {tab === "analytics" && <AnalyticsPanel analytics={analytics} />}
 
+      {tab === "findings" && <FindingsView findings={findings} />}
+
       {tab === "timeline" && (
-        <div>
+        <div className="space-y-4">
           {attacks.length === 0 ? (
             <EmptyState
               message={isRunning ? "Waiting for attack data..." : "No attacks to display in timeline."}
             />
           ) : (
-            <div className="card p-5">
-              <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-4 flex items-center gap-2">
-                <Zap className="w-3.5 h-3.5" /> Attack Sequence
-              </h4>
-              <TimelineView attacks={attacks} />
-            </div>
+            <>
+              <div className="card p-5">
+                <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-4 flex items-center gap-2">
+                  <Target className="w-3.5 h-3.5" /> Mutation Lineage
+                </h4>
+                <MutationTree attacks={attacks} />
+              </div>
+              <div className="card p-5">
+                <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-4 flex items-center gap-2">
+                  <Zap className="w-3.5 h-3.5" /> Attack Sequence
+                </h4>
+                <TimelineView attacks={attacks} />
+              </div>
+            </>
           )}
         </div>
       )}

@@ -187,6 +187,16 @@ class Vulnerability(Base, BaseMixin):
     verifier_confidence: Mapped[Optional[float]] = mapped_column(
         Float, nullable=True
     )
+    # Persisted structured-verdict evidence (E-21): the evaluator's and the
+    # independent verifier's quoted evidence are retained so the dashboard can
+    # show what each verdict was actually based on instead of reconstructing it
+    # from reasoning text.
+    evaluator_evidence: Mapped[Optional[List[str]]] = mapped_column(
+        JSON, nullable=True
+    )
+    verifier_evidence: Mapped[Optional[List[str]]] = mapped_column(
+        JSON, nullable=True
+    )
     verified_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

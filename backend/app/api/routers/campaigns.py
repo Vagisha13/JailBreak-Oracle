@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 
@@ -6,6 +7,7 @@ from sqlalchemy.future import select
 from sqlalchemy import func
 
 from app.core.auth import get_current_user
+from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.session import AsyncSessionLocal
 from app.models.domain import (
@@ -28,6 +30,30 @@ from app.api.access import get_target_or_403, get_project_or_403, get_experiment
 logger = get_logger("api.campaigns")
 
 router = APIRouter(prefix="/campaigns", tags=["Campaigns"])
+
+_SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "NONE": 0}
+
+
+def _aware(dt: datetime) -> datetime:
+    """Normalize naive DB timestamps to UTC (SQLite drivers drop tzinfo)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def campaign_is_stale(experiment: Experiment) -> bool:
+    """Mirror the worker's liveness semantics (E-25): only runnable campaigns
+    can be stale, judged on the heartbeat (legacy NULL falls back to
+    ``created_at``) vs. the campaign timeout."""
+    if experiment.status not in ("PENDING", "RUNNING"):
+        return False
+    last_activity = experiment.heartbeat_at or experiment.created_at
+    if last_activity is None:
+        return True
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        seconds=settings.CAMPAIGN_TIMEOUT_SECONDS
+    )
+    return _aware(last_activity) < cutoff
 
 
 def get_orchestrator() -> CampaignOrchestrator:
@@ -145,7 +171,9 @@ async def get_campaign_status(
 ):
     experiment = await get_experiment_or_403(experiment_id, current_user.id)
 
-    # Token/cost helm (E-12): roll up the campaign's persisted LLM ledger.
+    # Ledger + progress rollup (E-12/E-21): everything the dashboard displays —
+    # tokens, cost, per-role / per-model usage, current round — is derived from
+    # the persisted records, never synthesized client-side.
     async with AsyncSessionLocal() as session:
         usage_stmt = (
             select(
@@ -156,6 +184,83 @@ async def get_campaign_status(
         )
         usage_row = (await session.execute(usage_stmt)).one()
 
+        per_role_rows = (
+            await session.execute(
+                select(
+                    TokenUsage.role,
+                    func.count(TokenUsage.id),
+                    func.coalesce(func.sum(TokenUsage.prompt_tokens), 0),
+                    func.coalesce(func.sum(TokenUsage.completion_tokens), 0),
+                    func.coalesce(func.sum(TokenUsage.cost_usd), 0.0),
+                )
+                .where(TokenUsage.experiment_id == experiment.id)
+                .group_by(TokenUsage.role)
+                .order_by(TokenUsage.role)
+            )
+        ).all()
+        per_model_rows = (
+            await session.execute(
+                select(
+                    func.coalesce(TokenUsage.model, "unknown"),
+                    func.count(TokenUsage.id),
+                    func.coalesce(func.sum(TokenUsage.prompt_tokens), 0),
+                    func.coalesce(func.sum(TokenUsage.completion_tokens), 0),
+                    func.coalesce(func.sum(TokenUsage.cost_usd), 0.0),
+                )
+                .where(TokenUsage.experiment_id == experiment.id)
+                .group_by(TokenUsage.model)
+                .order_by(TokenUsage.model)
+            )
+        ).all()
+
+        current_round = (
+            await session.execute(
+                select(func.coalesce(func.max(Attack.round_number), 0)).where(
+                    Attack.experiment_id == experiment.id
+                )
+            )
+        ).scalar() or 0
+
+    prompt_tokens = usage_row[0]
+    completion_tokens = usage_row[1]
+    total_cost = round(float(usage_row[2]), 4)
+    max_cost = (
+        experiment.max_cost_usd
+        if experiment.max_cost_usd is not None
+        else settings.MAX_CAMPAIGN_COST
+    )
+
+    per_role: dict[str, dict] = {}
+    for role, calls, pt, ct, cost in per_role_rows:
+        per_role[role] = {
+            "calls": calls,
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "total_tokens": pt + ct,
+            "cost_usd": round(float(cost), 4),
+        }
+
+    per_model: dict[str, dict] = {}
+    for model, calls, pt, ct, cost in per_model_rows:
+        per_model[model] = {
+            "calls": calls,
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "total_tokens": pt + ct,
+            "cost_usd": round(float(cost), 4),
+        }
+
+    budget = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "total_cost_usd": total_cost,
+        "max_cost_usd": experiment.max_cost_usd,
+        "remaining_cost_usd": round(max(0.0, max_cost - total_cost), 4),
+        "per_role": per_role,
+        "per_model": per_model,
+    }
+
     return {
         "experiment_id": str(experiment.id),
         "name": experiment.name,
@@ -163,12 +268,12 @@ async def get_campaign_status(
         "attack_budget": experiment.attack_budget,
         "created_at": experiment.created_at.isoformat() if experiment.created_at else None,
         "finished_at": experiment.finished_at.isoformat() if experiment.finished_at else None,
-        "budget": {
-            "prompt_tokens": usage_row[0],
-            "completion_tokens": usage_row[1],
-            "total_cost_usd": round(float(usage_row[2]), 4),
-            "max_cost_usd": experiment.max_cost_usd,
-        },
+        "current_round": current_round,
+        "total_rounds": experiment.attack_budget,
+        "heartbeat_at": experiment.heartbeat_at.isoformat() if experiment.heartbeat_at else None,
+        "is_stale": campaign_is_stale(experiment),
+        "resumable": experiment.status in ("PENDING", "RUNNING"),
+        "budget": budget,
     }
 
 
@@ -227,6 +332,55 @@ async def get_campaign_attacks(
                 }
             )
         return results
+
+
+def _serialize_finding(vulnerability: Vulnerability) -> dict:
+    """Full finding payload backing the dashboard's confirmed-findings view."""
+    return {
+        "id": str(vulnerability.id),
+        "experiment_id": str(vulnerability.experiment_id),
+        "attack_id": str(vulnerability.attack_id),
+        "category": vulnerability.category,
+        "severity": vulnerability.severity,
+        "confidence": vulnerability.confidence,
+        "reasoning": vulnerability.reasoning,
+        "verified_status": vulnerability.verified_status,
+        "verification_reasoning": vulnerability.verification_reasoning,
+        "remediation_guidance": vulnerability.remediation_guidance,
+        "verifier_confidence": vulnerability.verifier_confidence,
+        "verified_at": (
+            vulnerability.verified_at.isoformat() if vulnerability.verified_at else None
+        ),
+        "created_at": (
+            vulnerability.created_at.isoformat() if vulnerability.created_at else None
+        ),
+        "evaluator_evidence": vulnerability.evaluator_evidence or [],
+        "verifier_evidence": vulnerability.verifier_evidence or [],
+    }
+
+
+@router.get("/{experiment_id}/findings")
+async def get_campaign_findings(
+    experiment_id: uuid.UUID, current_user: User = Depends(get_current_user)
+):
+    """All recorded vulns for a campaign, most severe first (E-21 findings list)."""
+    await get_experiment_or_403(experiment_id, current_user.id)
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(Vulnerability).where(
+            Vulnerability.experiment_id == experiment_id
+        )
+        vulnerabilities = (await session.execute(stmt)).scalars().all()
+
+    def _sort_key(v: Vulnerability):
+        return (
+            -_SEVERITY_RANK.get((v.severity or "").upper(), 0),
+            v.created_at or datetime.min.replace(tzinfo=timezone.utc),
+        )
+
+    return [
+        _serialize_finding(v) for v in sorted(vulnerabilities, key=_sort_key)
+    ]
 
 
 @router.post("/start", response_model=CampaignResponse)

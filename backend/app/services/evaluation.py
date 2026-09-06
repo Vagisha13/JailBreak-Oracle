@@ -70,6 +70,8 @@ class EvaluationService:
                     confidence=verdict.confidence,
                     reasoning=verdict.reasoning,
                     verified_status="UNCONFIRMED",
+                    # Retain the structured verdict's quoted evidence (E-21).
+                    evaluator_evidence=verdict.evidence or None,
                 )
                 session.add(vuln)
                 await session.commit()
