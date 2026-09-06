@@ -49,8 +49,48 @@ class AttackerAgent:
             rows = (await session.execute(stmt)).scalars().all()
         return {_normalize_prompt(p) for p in rows}
 
+    async def _load_conversation_history(
+        self, last_attack_id: uuid.UUID
+    ) -> list[dict]:
+        """Walk the ``parent_attack_id`` lineage oldest->newest, attaching the
+        target's latest response per turn so multi-turn strategies escalate
+        against the real conversation, not just the last exchange."""
+        from sqlalchemy.future import select
+        from sqlalchemy.orm import selectinload
+
+        async with AsyncSessionLocal() as session:
+            current_id: uuid.UUID | None = last_attack_id
+            turns: list[dict] = []
+            while current_id is not None:
+                attack = (
+                    await session.execute(
+                        select(Attack)
+                        .where(Attack.id == current_id)
+                        .options(selectinload(Attack.results))
+                    )
+                ).scalar_one_or_none()
+                if attack is None:
+                    break
+                target_response = None
+                if attack.results:
+                    target_response = attack.results[-1].target_response
+                turns.append(
+                    {
+                        "prompt_text": attack.prompt_text,
+                        "round_number": attack.round_number or 1,
+                        "target_response": target_response,
+                    }
+                )
+                current_id = attack.parent_attack_id
+        turns.reverse()
+        return turns
+
     async def generate_and_persist_attack(
-        self, strategy: AttackStrategy, objective: str, experiment_id: uuid.UUID
+        self,
+        strategy: AttackStrategy,
+        objective: str,
+        experiment_id: uuid.UUID,
+        round_number: int = 1,
     ) -> Attack:
         """
         Orchestrates RAG context retrieval, AI generation, and deterministic persistence.
@@ -93,6 +133,7 @@ class AttackerAgent:
                 strategy_name=validated_payload.strategy_name,
                 category=validated_payload.category,
                 prompt_text=validated_payload.prompt_text,
+                round_number=round_number,
             )
             session.add(new_attack)
             await session.commit()
@@ -124,7 +165,10 @@ class AttackerAgent:
         The persisted ``Attack`` is lineage-linked via ``parent_attack_id`` and
         recorded in ``attack_mutations``.
         """
-        sys_prompt = strategy.get_mutation_prompt(objective, last_attack, feedback)
+        conversation = await self._load_conversation_history(last_attack["id"])
+        sys_prompt = strategy.get_mutation_prompt(
+            objective, last_attack, feedback, conversation_history=conversation
+        )
         response = await self.provider.execute(sys_prompt, {"temperature": 0.8})
 
         if response.error:

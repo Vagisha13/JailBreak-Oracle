@@ -36,9 +36,19 @@ class AttackStrategy(ABC):
         return False
 
     def get_mutation_prompt(
-        self, objective: str, last_attack: dict, feedback: "AttackFeedback"
+        self,
+        objective: str,
+        last_attack: dict,
+        feedback: "AttackFeedback",
+        conversation_history: list[dict] | None = None,
     ) -> str:
-        """Build the prompt that evolves ``last_attack`` using evaluator feedback."""
+        """Build the prompt that evolves ``last_attack`` using evaluator feedback.
+
+        ``conversation_history`` (optional) is the oldest->newest list of prior
+        ``{"prompt_text", "target_response", "round_number"}`` turns for the
+        conversation, enabling multi-turn strategies to escalate coherently
+        across more than two turns.
+        """
         raise NotImplementedError(f"Strategy '{self.name}' does not support mutation.")
 
     def metadata(self) -> dict:

@@ -205,3 +205,18 @@ Still open (intentional): docker-compose app stack (`backend`/`worker`/`frontend
 New tests: `tests/test_mutation.py` (5) — lineage persistence, dedup, adaptive/multi-turn prompt construction, and a full campaign-loop RETRY integration test (blocked primary → feedback mutation → confirmed jailbreak).
 
 Architecture notes: orchestrator stores `MutationEngine` internally (from the attacker agent) so both router and worker paths get it automatically; verifier feedback is wired into `AttackFeedback.verifier_result` for future false-positive steering.
+
+---
+
+## 11. Phase 4 — Multi-turn conversation state + resumable campaigns (2026-09-06)
+
+**73/73 tests pass.** Lint + typecheck gates green.
+
+| Area | Resolution |
+|---|---|
+| Multi-turn conversation state (E-08 remainder) | `AttackerAgent._load_conversation_history` walks the `parent_attack_id` lineage oldest→newest and attaches each turn's latest target response. `AttackStrategy.get_mutation_prompt` gained `conversation_history`; `MultiTurnStrategy` now renders a full "CONVERSATION SO FAR" transcript across >2 turns instead of only the last exchange, and `AdaptiveMutationStrategy` weighs lineage depth (`n turn(s) deep`) into its mutation directives. Root attacks now stamp `round_number` (`generate_and_persist_attack(round_number=...)`). |
+| DB-backed round state / resume (E-06 remainder) | `CampaignOrchestrator.run_campaign` hydrates progress via `_load_progress`: starting round from `max(round_number)`, plus `strategies_used` and per-strategy jailbreak scores recomputed from persisted attacks/vulnerabilities. A re-run continues from round N+1 instead of replaying round 1 (verified: 2-round run + 5-round resume yields exactly rounds 1..5, no duplicates). |
+| Live model (E-14) | `AgentRun` is no longer dead code: the orchestrator persists per-round telemetry rows for `attacker`, `evaluator` (round/verdict/severity/category/attack_id), `verifier` (confirmed status from `VerificationResult`), and a final `campaign` round-state row. Best-effort: telemetry failures never abort the campaign. |
+| Worker restart recovery | `app/worker.py::recover_stale_campaigns` now reverts stale RUNNING experiments to PENDING and re-queues them (key `resumed_running`), so a worker crash resumes a campaign from its DB round state instead of permanently failing it. Resumed IDs are excluded from the "very old PENDING → FAILED" sweep on the same pass. |
+
+New tests: `tests/test_stateful_campaign.py` (4) — full conversation-history chaining, adaptive-mutation turn-depth, cross-run resume continuity, and `AgentRun` telemetry shape. Updated `tests/test_campaign_lifecycle.py` for the RUNNING→PENDING resume semantics.

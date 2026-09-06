@@ -11,7 +11,9 @@ Run with: ``python -m app.worker`` (or the ``worker`` service in Docker).
 
 Guarantees:
   * A worker crash cannot leave a campaign permanently RUNNING: stale RUNNING
-    campaigns are marked FAILED on startup, and PENDING campaigns are re-queued.
+    campaigns are revereted to PENDING and re-queued on startup so they resume
+    from persisted DB round state instead of restarting from scratch.
+  * PENDING campaigns are re-queued after the grace period.
   * Provider failures mark the campaign FAILED (never stuck RUNNING).
 """
 import asyncio
@@ -102,9 +104,13 @@ async def _get_status(experiment_id: uuid.UUID) -> Optional[str]:
         return experiment.status if experiment else None
 
 
-async def _mark_stale_running_failed(max_age_seconds: int, now: datetime) -> list[uuid.UUID]:
+async def _resume_stale_running(
+    max_age_seconds: int, now: datetime
+) -> list[uuid.UUID]:
+    """Revert RUNNING campaigns stuck past the timeout to PENDING so the worker
+    re-runs them and the orchestrator resumes from its DB round state."""
     cutoff = now - timedelta(seconds=max_age_seconds)
-    recovered: list[uuid.UUID] = []
+    resumed: list[uuid.UUID] = []
     async with AsyncSessionLocal() as session:
         stale = (
             await session.execute(
@@ -115,12 +121,12 @@ async def _mark_stale_running_failed(max_age_seconds: int, now: datetime) -> lis
             )
         ).scalars().all()
         for experiment in stale:
-            experiment.status = "FAILED"
-            experiment.finished_at = now
-            recovered.append(experiment.id)
+            experiment.status = "PENDING"
+            experiment.finished_at = None
+            resumed.append(experiment.id)
         if stale:
             await session.commit()
-    return recovered
+    return resumed
 
 
 async def recover_stale_campaigns(
@@ -128,7 +134,8 @@ async def recover_stale_campaigns(
 ) -> dict:
     """
     Recovery routine run on worker startup:
-      1. RUNNING campaigns older than the campaign timeout -> FAILED.
+      1. RUNNING campaigns older than the campaign timeout -> PENDING (resumed,
+         the orchestrator continues from persisted round state on re-run).
       2. PENDING campaigns past the re-enqueue grace period -> re-queued.
       3. PENDING campaigns older than the campaign timeout -> FAILED.
     """
@@ -137,19 +144,24 @@ async def recover_stale_campaigns(
     pid_cutoff = now - timedelta(seconds=max_age_seconds)
     grace_cutoff = now - timedelta(seconds=PENDING_GRACE_SECONDS)
 
-    failed_running = await _mark_stale_running_failed(max_age_seconds, now)
+    resumed_running = await _resume_stale_running(max_age_seconds, now)
 
     re_enqueued: list[uuid.UUID] = []
     failed_pending: list[uuid.UUID] = []
 
     async with AsyncSessionLocal() as session:
-        pending = (
-            await session.execute(
-                select(Experiment).where(
-                    Experiment.status == "PENDING",
-                    Experiment.created_at < grace_cutoff,
-                )
+        pending_stmt = select(Experiment).where(
+            Experiment.status == "PENDING",
+            Experiment.created_at < grace_cutoff,
+        )
+        if resumed_running:
+            # Just-resumed campaigns must be re-queued, not swept into the
+            # "very old PENDING -> FAILED" branch on the same pass.
+            pending_stmt = pending_stmt.where(
+                ~Experiment.id.in_(resumed_running)
             )
+        pending = (
+            await session.execute(pending_stmt)
         ).scalars().all()
 
         for experiment in pending:
@@ -160,23 +172,25 @@ async def recover_stale_campaigns(
         if failed_pending:
             await session.commit()
 
-    for experiment_id in [e.id for e in pending if e.id not in failed_pending]:
+    for experiment_id in resumed_running + [
+        e.id for e in pending if e.id not in failed_pending
+    ]:
         if await enqueue_campaign(experiment_id):
             re_enqueued.append(experiment_id)
 
-    if failed_running or failed_pending or re_enqueued:
+    if resumed_running or failed_pending or re_enqueued:
         logger.info(
             "Recovered stale campaigns",
             extra={
                 "event_name": "worker.recovery",
-                "num_failed_running": len(failed_running),
+                "num_resumed_running": len(resumed_running),
                 "num_failed_pending": len(failed_pending),
                 "num_requeued": len(re_enqueued),
             },
         )
 
     return {
-        "failed_running": failed_running,
+        "resumed_running": resumed_running,
         "failed_pending": failed_pending,
         "requeued": re_enqueued,
     }

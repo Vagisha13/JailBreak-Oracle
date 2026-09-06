@@ -1,10 +1,16 @@
-import uuid
+﻿import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy.future import select
 
 from app.db.session import AsyncSessionLocal
-from app.models.domain import Experiment, Target
+from app.models.domain import (
+    AgentRun,
+    Attack,
+    Experiment,
+    Target,
+    Vulnerability,
+)
 from app.schemas.campaign import CampaignConfig, CampaignSummary
 from app.agents.attacker import AttackerAgent
 from app.agents.evaluator import EvaluatorAgent
@@ -104,7 +110,6 @@ class CampaignOrchestrator:
         """
         rounds_executed = 0
         vulnerabilities_found = 0
-        strategies_used: set[str] = set()
         consecutive_failures = 0
 
         try:
@@ -129,13 +134,20 @@ class CampaignOrchestrator:
             # 3. Get available strategies
             available_strategies = list_strategies()
 
-            # Feedback-driven planning state: score strategies by observed success.
-            strategy_scores: dict[str, float] = {}
-            # Mutations are costly LLM calls — cap them to avoid runaway spend.
+            # 4. Rehydrate round progress from the DB so a resumed campaign
+            #    continues where it stopped (worker restart / retry-safe).
+            starting_round, strategies_used, strategy_scores = (
+                await self._load_progress(
+                    config.experiment_id, config.max_rounds, available_strategies
+                )
+            )
+            if not strategies_used:
+                strategies_used = set()
+            # Mutations are costly LLM calls â€” cap them to avoid runaway spend.
             mutation_budget = max(1, (config.attack_budget or 1) // 2)
             mutation_attempts = 0
 
-            for round_num in range(1, config.max_rounds + 1):
+            for round_num in range(starting_round, config.max_rounds + 1):
                 rounds_executed = round_num
 
                 # PLAN: explore new strategies vs. exploit the best-scoring one.
@@ -150,6 +162,7 @@ class CampaignOrchestrator:
                     strategy=strategy,
                     objective=config.objective,
                     experiment_id=config.experiment_id,
+                    round_number=round_num,
                 )
                 logger.info(
                     "Attack generated",
@@ -159,6 +172,11 @@ class CampaignOrchestrator:
                         "strategy": strategy_name,
                         "iteration": round_num,
                     },
+                )
+                await self._record_agent_run(
+                    config.experiment_id,
+                    "attacker",
+                    {"round": round_num, "strategy": strategy_name, "attack_id": str(attack.id)},
                 )
 
                 # EXECUTE: Send to target
@@ -192,6 +210,17 @@ class CampaignOrchestrator:
                         "status": "jailbreak" if eval_summary.verdict.is_jailbreak else "blocked",
                     },
                 )
+                await self._record_agent_run(
+                    config.experiment_id,
+                    "evaluator",
+                    {
+                        "round": round_num,
+                        "attack_id": str(attack.id),
+                        "verdict": "jailbreak" if eval_summary.verdict.is_jailbreak else "blocked",
+                        "severity": eval_summary.verdict.severity,
+                        "category": eval_summary.verdict.category,
+                    },
+                )
 
                 # LEARN: Track results
                 if eval_summary.verdict.is_jailbreak:
@@ -202,11 +231,21 @@ class CampaignOrchestrator:
                     # VERIFY: Independent confirmation
                     if self.verification_service and eval_summary.vulnerability_id:
                         try:
-                            await self.verification_service.verify_vulnerability(
+                            verified = await self.verification_service.verify_vulnerability(
                                 eval_summary.vulnerability_id
                             )
                         except Exception:
-                            pass  # Verification failure doesn't block campaign
+                            verified = None
+                        await self._record_agent_run(
+                            config.experiment_id,
+                            "verifier",
+                            {
+                                "round": round_num,
+                                "attack_id": str(attack.id),
+                                "vulnerability_id": str(eval_summary.vulnerability_id),
+                                "confirmed": bool(verified and verified.verified_status == "CONFIRMED_VULNERABILITY"),
+                            },
+                        )
 
                     if config.stop_on_first_success:
                         break
@@ -264,13 +303,40 @@ class CampaignOrchestrator:
                                     and mutated_eval.vulnerability_id
                                 ):
                                     try:
-                                        await self.verification_service.verify_vulnerability(
+                                        verified = await self.verification_service.verify_vulnerability(
                                             mutated_eval.vulnerability_id
                                         )
                                     except Exception:
-                                        pass
+                                        verified = None
+                                    await self._record_agent_run(
+                                        config.experiment_id,
+                                        "verifier",
+                                        {
+                                            "round": round_num,
+                                            "attack_id": str(mutated.id),
+                                            "vulnerability_id": str(
+                                                mutated_eval.vulnerability_id
+                                            ),
+                                            "confirmed": bool(
+                                                verified
+                                                and verified.verified_status
+                                                == "CONFIRMED_VULNERABILITY"
+                                            ),
+                                        },
+                                    )
                                 if config.stop_on_first_success:
                                     break
+
+            # Record per-round campaign state (DB-backed round bookkeeping).
+            await self._record_agent_run(
+                config.experiment_id,
+                "campaign",
+                {
+                    "rounds_completed": rounds_executed,
+                    "vulnerabilities_found": vulnerabilities_found,
+                    "status": "COMPLETED",
+                },
+            )
 
             # Mark campaign as COMPLETED
             await self._update_experiment_status(config.experiment_id, "COMPLETED")
@@ -312,6 +378,73 @@ class CampaignOrchestrator:
                 total_vulnerabilities_found=vulnerabilities_found,
                 status="FAILED",
                 error=str(exc),
+            )
+
+    async def _load_progress(
+        self,
+        experiment_id: uuid.UUID,
+        max_rounds: int,
+        available_strategies: list[str],
+    ) -> tuple[int, set[str], dict[str, float]]:
+        """Hydrate round progress from the DB so a resumed or retried campaign
+        continues where it stopped: returns the starting round, the set of
+        strategies already exercised, and per-strategy jailbreak scores."""
+        async with AsyncSessionLocal() as session:
+            attack_stmt = (
+                select(Attack.id, Attack.strategy_name, Attack.round_number)
+                .where(Attack.experiment_id == experiment_id)
+            )
+            attack_rows = (await session.execute(attack_stmt)).all()
+
+            name_by_id: dict[uuid.UUID, str] = {}
+            strategies_used: set[str] = set()
+            strategy_scores: dict[str, float] = {}
+            max_round = 0
+            for attack_id, strategy_name, round_number in attack_rows:
+                name_by_id[attack_id] = strategy_name or ""
+                if strategy_name:
+                    strategies_used.add(strategy_name)
+                    if strategy_name in available_strategies:
+                        strategy_scores.setdefault(strategy_name, 0.0)
+                if round_number:
+                    max_round = max(max_round, round_number)
+
+            vuln_stmt = (
+                select(Vulnerability.attack_id)
+                .join(Attack, Attack.id == Vulnerability.attack_id)
+                .where(Attack.experiment_id == experiment_id)
+            )
+            for (attack_id,) in (await session.execute(vuln_stmt)).all():
+                strategy_name = name_by_id.get(attack_id, "")
+                if strategy_name in strategy_scores:
+                    strategy_scores[strategy_name] += 1.0
+
+        starting_round = min(max_round + 1, max_rounds + 1)
+        return starting_round, strategies_used, strategy_scores
+
+    async def _record_agent_run(
+        self, experiment_id: uuid.UUID, agent_type: str, state: dict
+    ):
+        """Persist per-round agent state as ``AgentRun`` telemetry. Best-effort:
+        telemetry failures must never abort a running campaign."""
+        try:
+            async with AsyncSessionLocal() as session:
+                session.add(
+                    AgentRun(
+                        experiment_id=experiment_id,
+                        agent_type=agent_type,
+                        state_json=state,
+                    )
+                )
+                await session.commit()
+        except Exception:
+            logger.warning(
+                "Failed to persist AgentRun telemetry",
+                extra={
+                    "event_name": "campaign.telemetry_failed",
+                    "agent_type": agent_type,
+                },
+                exc_info=True,
             )
 
     @staticmethod

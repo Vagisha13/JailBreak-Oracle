@@ -258,12 +258,14 @@ async def test_stale_running_and_pending_recovery():
         max_age_seconds=3600, now=now
     )
 
-    assert running_id in result["failed_running"]
+    assert running_id in result["resumed_running"]
     assert pending_old_id in result["failed_pending"]
 
     async with AsyncSessionLocal() as session:
         for eid, expected in (
-            (running_id, "FAILED"),
+            # Stale RUNNING campaigns are reverted to PENDING (DB round state
+            # lets the orchestrator resume rather than restart).
+            (running_id, "PENDING"),
             (pending_old_id, "FAILED"),
             (fresh_id, "PENDING"),
         ):
@@ -272,7 +274,7 @@ async def test_stale_running_and_pending_recovery():
             ).scalars().first()
             assert exp.status == expected, eid
 
-    assert fresh_id not in result["failed_running"]
+    assert fresh_id not in result["resumed_running"]
     assert fresh_id not in result["failed_pending"]
 
 
