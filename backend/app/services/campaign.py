@@ -9,12 +9,20 @@ from app.models.domain import (
     Attack,
     Experiment,
     Target,
+    TokenUsage,
     Vulnerability,
 )
 from app.schemas.campaign import CampaignConfig, CampaignSummary
 from app.agents.attacker import AttackerAgent
 from app.agents.evaluator import EvaluatorAgent
 from app.agents.verifier import VerifierAgent
+from app.services.budget import (
+    BudgetExceededError,
+    BudgetedTargetProvider,
+    CampaignBudget,
+    TokenTracker,
+    TokenUsageEntry,
+)
 from app.services.execution import ExecutionService
 from app.services.evaluation import EvaluationService
 from app.services.verification import VerificationService
@@ -22,6 +30,7 @@ from app.services.memory import MemoryService
 from app.strategies.registry import get_strategy, list_strategies
 from app.schemas.feedback import AttackFeedback
 from app.services.mutation import MutationEngine
+from app.core.config import settings
 from app.core.logging import get_logger
 
 logger = get_logger("campaign")
@@ -45,6 +54,15 @@ class CampaignOrchestrator:
         self.evaluator_agent = evaluator_agent
         self.memory_service = memory_service
         self.verifier_agent = verifier_agent
+
+        # Core (unwrapped) providers. Every ``run_campaign`` re-wraps these in a
+        # fresh ``BudgetedTargetProvider`` with a per-run tracker so successive
+        # runs never stack wrappers around wrappers (double-counting usage).
+        self._attacker_provider = attacker_agent.provider
+        self._evaluator_provider = evaluator_agent.provider
+        self._verifier_provider = (
+            verifier_agent.provider if verifier_agent else None
+        )
 
         self.execution_service = ExecutionService()
         self.evaluation_service = EvaluationService(self.evaluator_agent)
@@ -101,6 +119,7 @@ class CampaignOrchestrator:
                 attack_budget=experiment.attack_budget,
                 exploration_ratio=experiment.exploration_ratio,
                 stop_on_first_success=False,
+                max_cost_usd=settings.MAX_CAMPAIGN_COST,
             )
 
     async def run_campaign(self, config: CampaignConfig) -> CampaignSummary:
@@ -111,6 +130,16 @@ class CampaignOrchestrator:
         rounds_executed = 0
         vulnerabilities_found = 0
         consecutive_failures = 0
+        # Defaults so the except branches can always reference the budget state.
+        budget = CampaignBudget(
+            max_cost_usd=(
+                config.max_cost_usd
+                if config.max_cost_usd is not None
+                else settings.MAX_CAMPAIGN_COST
+            ),
+            tracker=TokenTracker(),
+        )
+        tracker: TokenTracker = budget.tracker
 
         try:
             # 1. Verify target exists
@@ -131,10 +160,62 @@ class CampaignOrchestrator:
                 },
             )
 
-            # 3. Get available strategies
+            # 3. Budget enforcement (E-12): seed spend from prior runs so a
+            #    resumed campaign keeps its budget, then wrap every LLM provider
+            #    (attacker/evaluator/verifier/target) in tracking wrappers that
+            #    record usage and tripwire BEFORE each call.
+            prior_cost, prior_tokens = await self._load_campaign_spend(
+                config.experiment_id
+            )
+            tracker = TokenTracker(
+                resumed_cost_usd=prior_cost, resumed_tokens=prior_tokens
+            )
+            budget = CampaignBudget(
+                max_cost_usd=(
+                    config.max_cost_usd
+                    if config.max_cost_usd is not None
+                    else settings.MAX_CAMPAIGN_COST
+                ),
+                tracker=tracker,
+            )
+            self.attacker_agent.provider = BudgetedTargetProvider(
+                delegate=self._attacker_provider,
+                tracker=tracker,
+                budget=budget,
+                role="attacker",
+                default_model=settings.ATTACKER_MODEL,
+                experiment_id=config.experiment_id,
+                persist_cb=self._persist_usage_entry,
+            )
+            self.evaluator_agent.provider = BudgetedTargetProvider(
+                delegate=self._evaluator_provider,
+                tracker=tracker,
+                budget=budget,
+                role="evaluator",
+                default_model=settings.EVALUATOR_MODEL,
+                experiment_id=config.experiment_id,
+                persist_cb=self._persist_usage_entry,
+            )
+            if self.verifier_agent:
+                assert self._verifier_provider is not None
+                self.verifier_agent.provider = BudgetedTargetProvider(
+                    delegate=self._verifier_provider,
+                    tracker=tracker,
+                    budget=budget,
+                    role="verifier",
+                    default_model=settings.VERIFIER_MODEL,
+                    experiment_id=config.experiment_id,
+                    persist_cb=self._persist_usage_entry,
+                )
+            self.execution_service.tracker = tracker
+            self.execution_service.budget = budget
+            self.execution_service.experiment_id = config.experiment_id
+            self.execution_service.persist_cb = self._persist_usage_entry
+
+            # 4. Get available strategies
             available_strategies = list_strategies()
 
-            # 4. Rehydrate round progress from the DB so a resumed campaign
+            # 5. Rehydrate round progress from the DB so a resumed campaign
             #    continues where it stopped (worker restart / retry-safe).
             starting_round, strategies_used, strategy_scores = (
                 await self._load_progress(
@@ -363,6 +444,7 @@ class CampaignOrchestrator:
                     "rounds_completed": rounds_executed,
                     "vulnerabilities_found": vulnerabilities_found,
                     "status": "COMPLETED",
+                    "budget": tracker.as_telemetry(),
                 },
             )
 
@@ -375,6 +457,7 @@ class CampaignOrchestrator:
                     "campaign_id": str(config.experiment_id),
                     "status": "COMPLETED",
                     "num_attacks": rounds_executed,
+                    "total_cost_usd": tracker.total_cost_usd,
                 },
             )
 
@@ -384,6 +467,41 @@ class CampaignOrchestrator:
                 total_rounds_executed=rounds_executed,
                 total_vulnerabilities_found=vulnerabilities_found,
                 status="COMPLETED",
+                total_cost_usd=tracker.total_cost_usd,
+            )
+
+        except BudgetExceededError as exc:
+            await self._update_experiment_status(config.experiment_id, "FAILED")
+            await self._record_agent_run(
+                config.experiment_id,
+                "campaign",
+                {
+                    "rounds_completed": rounds_executed,
+                    "vulnerabilities_found": vulnerabilities_found,
+                    "status": "FAILED",
+                    "reason": "budget_exceeded",
+                    "budget": tracker.as_telemetry(),
+                },
+            )
+            logger.error(
+                "Campaign budget exceeded",
+                extra={
+                    "event_name": "campaign.budget_exceeded",
+                    "campaign_id": str(config.experiment_id),
+                    "status": "FAILED",
+                    "max_cost_usd": budget.max_cost_usd,
+                    "total_cost_usd": tracker.total_cost_usd,
+                },
+            )
+            return CampaignSummary(
+                experiment_id=config.experiment_id,
+                target_id=config.target_id,
+                total_rounds_executed=rounds_executed,
+                total_vulnerabilities_found=vulnerabilities_found,
+                status="FAILED",
+                error=str(exc),
+                message="Campaign budget exceeded",
+                total_cost_usd=tracker.total_cost_usd,
             )
 
         except Exception as exc:
@@ -449,6 +567,47 @@ class CampaignOrchestrator:
 
         starting_round = min(max_round + 1, max_rounds + 1)
         return starting_round, strategies_used, strategy_scores
+
+    async def _load_campaign_spend(
+        self, experiment_id: uuid.UUID
+    ) -> tuple[float, int]:
+        """Total persisted spend for the experiment (USD, tokens) across runs."""
+        try:
+            async with AsyncSessionLocal() as session:
+                stmt = select(TokenUsage.cost_usd, TokenUsage.total_tokens).where(
+                    TokenUsage.experiment_id == experiment_id
+                )
+                rows = (await session.execute(stmt)).all()
+        except Exception:
+            return 0.0, 0
+        cost = round(sum((r[0] or 0.0) for r in rows), 8)
+        tokens = sum((r[1] or 0) for r in rows)
+        return cost, tokens
+
+    async def _persist_usage_entry(
+        self, experiment_id: uuid.UUID, entry: TokenUsageEntry
+    ) -> None:
+        """Best-effort per-call ledger persistence (E-12). Failures must never
+        abort an LLM call or a campaign."""
+        try:
+            async with AsyncSessionLocal() as session:
+                session.add(
+                    TokenUsage(
+                        experiment_id=experiment_id,
+                        role=entry.role,
+                        model=entry.model,
+                        prompt_tokens=entry.prompt_tokens,
+                        completion_tokens=entry.completion_tokens,
+                        total_tokens=entry.prompt_tokens + entry.completion_tokens,
+                        cost_usd=entry.cost_usd,
+                    )
+                )
+                await session.commit()
+        except Exception:
+            logger.warning(
+                "Failed to persist token usage entry",
+                extra={"event_name": "campaign.usage_persist_failed"},
+            )
 
     async def _record_agent_run(
         self, experiment_id: uuid.UUID, agent_type: str, state: dict

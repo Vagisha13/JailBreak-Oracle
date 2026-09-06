@@ -264,3 +264,18 @@ New tests: `tests/test_structured_outputs.py` (8) — verdict derivation both wa
 | E-11 (no endpoint) | `POST /api/v1/reports/experiment/{id}/defense` returns a structured `DefenseReport` (recommendations, regression score, assessment, `is_fallback`) after owner 403/404 checks. Wired via `DEFENDER_PROVIDER`/`DEFENDER_MODEL` settings through the shared `TargetFactory` (mock-safe in CI via the tests' provider fixture). |
 
 New tests: `tests/test_defender.py` (12) — LLM JSON parsing, fallback on no-provider/provider-error/invalid-JSON/out-of-range-regression, empty-context handling, weighted regression score math (CRITICAL 40·1.0 + HIGH 25·0.9 = 62.5), service-level LLM + fallback paths (verifier guidance surfaced), unknown-experiment 404, API 200 with dependency override, and cross-owner 403.
+
+---
+
+## 15. Phase 8 — Cost governance (TokenTracker + budget tripwires) (2026-09-06)
+
+**111/111 tests pass.** Lint + typecheck gates green.
+
+| Issue | Resolution |
+|---|---|
+| E-12 (per-model cost table) | New `app/services/budget.py` ships an explicit `MODEL_COST_USD_PER_1K` table (gpt-4o-mini/4o/4-turbo/4, claude-3-5-sonnet/opus/haiku, deepseek-chat/reasoner, `ollama` = $0) with longest-first substring resolution and a documented conservative default for unknown models. `estimate_cost_usd(model, prompt_tokens, completion_tokens)` derives USD spend from every call. |
+| E-12 (tracking discarded usage) | `TokenTracker` now records **every** LLM call — attacker, target, evaluator, verifier — not just target calls. `BudgetedTargetProvider` is a transparent `TargetProvider` wrapper the orchestrator installs around all four providers per run (stored core providers prevent wrapper-stacking across resumed runs). Token counts flow from `TargetResponse` on all paths. |
+| E-12 (budget before call) | `CampaignBudget.check_allow()` trips **before** each LLM call using a conservative estimate (prompt chars/4 + 1024 completion-token reserve); `BudgetExceededError` aborts the campaign, marking it FAILED with a `campaign.budget_exceeded` event and a final `campaign` AgentRun containing the reason + budget telemetry. `MAX_CAMPAIGN_COST` is now enforced via `CampaignConfig.max_cost_usd` (set by `_build_config`, default `settings.MAX_CAMPAIGN_COST`). |
+| E-12 (no persistence / resume) | Migration `e5f1d2c4a7b9_token_usage` adds the `token_usage` ledger (role, model, tokens, cost_usd, FK→experiments) — round-trip + schema parity verified on fresh SQLite. Each call persists best-effort (`_persist_usage_entry`, failures never abort a call); `_load_campaign_spend` seeds a resumed campaign's tracker so the budget survives worker restarts instead of restarting at zero. Target `AttackResult.token_usage_json` now also records `model`/`cost_usd`/`role`. |
+
+New tests: `tests/test_budget.py` (12) — cost-table resolution (specific, substring, ollama, unknown default), cost math, per-role tracking, seeded resume spend, pre-call tripwire, remaining-budget floor, wrapper recording+persistence, wrapper block-before-delegate on exceeded budget, config-model override, campaign ledger persistence + reported cost, resume-not-double-counting, and FAILED-on-budget-exceeded lifecycle.

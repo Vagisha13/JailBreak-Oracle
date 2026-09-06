@@ -98,6 +98,9 @@ class Experiment(Base, BaseMixin):
     agent_runs: Mapped[List["AgentRun"]] = relationship(
         "AgentRun", back_populates="experiment"
     )
+    token_usage: Mapped[List["TokenUsage"]] = relationship(
+        "TokenUsage", back_populates="experiment"
+    )
 
 
 class Attack(Base, BaseMixin):
@@ -202,6 +205,27 @@ class AgentRun(Base, BaseMixin):
 
     experiment: Mapped["Experiment"] = relationship(
         "Experiment", back_populates="agent_runs"
+    )
+
+
+class TokenUsage(Base, BaseMixin):
+    __tablename__ = "token_usage"
+
+    experiment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("experiments.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(50), nullable=False)
+    model: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+
+    experiment: Mapped["Experiment"] = relationship(
+        "Experiment", back_populates="token_usage"
     )
 
 

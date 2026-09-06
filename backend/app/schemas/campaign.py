@@ -46,6 +46,11 @@ class CampaignConfig(BaseModel):
     attack_budget: int = Field(50, ge=1, le=settings.MAX_ATTACK_BUDGET)
     exploration_ratio: float = Field(0.3, ge=0.0, le=1.0)
     stop_on_first_success: bool = False
+    max_cost_usd: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Per-campaign cost cap (USD); defaults to MAX_CAMPAIGN_COST",
+    )
 
 
 class CampaignSummary(BaseModel):
@@ -58,3 +63,6 @@ class CampaignSummary(BaseModel):
     status: str
     error: Optional[str] = None
     message: Optional[str] = None
+    total_cost_usd: Optional[float] = Field(
+        default=None, description="Total tracked LLM spend for the campaign (USD)"
+    )
