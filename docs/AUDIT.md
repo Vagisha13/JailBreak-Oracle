@@ -169,3 +169,21 @@ New tooling commands (run from repo root): `make lint`, `make typecheck`, `make 
 New `make check` is the exact CI entrypoint for backend so local == CI.
 
 Open items carried into Phase 2: regenerated ORM-synced migration + orphan-table drop, verifier unification (E-05), and the full docker-compose app stack. Root `README.md` deliberately deferred past Phase 1 (E-17 partial).
+
+---
+
+## 9. Phase 2 — Schema landing & verifier unification (2026-09-06)
+
+**64/64 tests pass.** Lint + typecheck gates green.
+
+| Phase 0 issue | Resolution |
+|---|---|
+| E-04 (Critical) | ORM-synced initial migration verified against a fresh SQLite DB: table set matches `Base.metadata` exactly (9 business tables; only `alembic_version` extra), all columns present, no orphan tables (`analytics_reports`, `model_calls`, `defenses`, `regression_tests`, `defense_tests` gone). `upgrade`→`downgrade base`→`upgrade` round-trip verified. `agent_runs` (`agent_type/state_json`) and `attack_mutations` (`attack_id/mutation_type/mutated_prompt`) now match the ORM. |
+| E-05 (High) | New `app/services/factory.py::build_campaign_orchestrator()` is the single composition root. Router (`campaigns.py:get_orchestrator`), worker (`worker.py:build_orchestrator`), and `api/deps.py` all delegate to it; the router's in-process fallback now wires a verifier, so **dual verification runs on every execution path**. Regression tests in `tests/test_factory.py` lock this in. |
+
+Migration check command (used during Phase 2 verification):
+```
+cd backend && ASYNC=... SYNC=sqlite:///./_migration_check.db alembic upgrade head
+```
+
+Still open (intentional): docker-compose app stack (`backend`/`worker`/`frontend` services + README) — scheduled with the container-phase; `AgentRun` telemetry wiring; budget enforcement (Phase 8).

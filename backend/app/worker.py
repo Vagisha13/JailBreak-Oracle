@@ -41,9 +41,9 @@ def _aware(dt: datetime) -> datetime:
 
 def build_orchestrator():
     """Build the campaign orchestrator used by the worker."""
-    from app.api.deps import get_campaign_orchestrator
+    from app.services.factory import build_campaign_orchestrator
 
-    return get_campaign_orchestrator()
+    return build_campaign_orchestrator(include_verifier=True)
 
 
 async def process_campaign_job(experiment_id: uuid.UUID, orchestrator=None) -> str:

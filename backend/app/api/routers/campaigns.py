@@ -6,17 +6,12 @@ from sqlalchemy.future import select
 from sqlalchemy import func
 
 from app.core.auth import get_current_user
-from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.session import AsyncSessionLocal
 from app.models.domain import User, Project, Target, Experiment, Vulnerability, Attack, AttackResult
 from app.schemas.campaign import CampaignStartRequest, CampaignResponse
+from app.services.factory import build_campaign_orchestrator
 from app.services.campaign import CampaignOrchestrator
-from app.agents.attacker import AttackerAgent
-from app.agents.evaluator import EvaluatorAgent
-from app.services.memory import MemoryService
-from app.targets.factory import TargetFactory
-from app.targets.embeddings import EmbeddingProvider, MockEmbeddingProvider
 from app.services.queue import enqueue_campaign
 from app.api.access import get_target_or_403, get_project_or_403, get_experiment_or_403
 
@@ -26,29 +21,7 @@ router = APIRouter(prefix="/campaigns", tags=["Campaigns"])
 
 
 def get_orchestrator() -> CampaignOrchestrator:
-    attacker_provider = TargetFactory.get_provider(
-        settings.ATTACKER_PROVIDER, default_model=settings.ATTACKER_MODEL
-    )
-    evaluator_provider = TargetFactory.get_provider(
-        settings.EVALUATOR_PROVIDER, default_model=settings.EVALUATOR_MODEL
-    )
-
-    embedding_provider: EmbeddingProvider = MockEmbeddingProvider()
-    if settings.EMBEDDING_PROVIDER == "openai":
-        from app.targets.embeddings import OpenAIEmbeddingProvider
-
-        embedding_provider = OpenAIEmbeddingProvider(model_name=settings.EMBEDDING_MODEL)
-
-    memory_service = MemoryService(embedding_provider=embedding_provider)
-
-    attacker = AttackerAgent(provider=attacker_provider, memory_service=memory_service)
-    evaluator = EvaluatorAgent(provider=evaluator_provider)
-
-    return CampaignOrchestrator(
-        attacker_agent=attacker,
-        evaluator_agent=evaluator,
-        memory_service=memory_service,
-    )
+    return build_campaign_orchestrator()
 
 
 @router.get("/stats")
