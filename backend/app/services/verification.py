@@ -1,12 +1,21 @@
 import uuid
+from datetime import datetime, timezone
+
 from sqlalchemy.future import select
+
 from app.db.session import AsyncSessionLocal
 from app.models.domain import Vulnerability, Attack, AttackResult
-from app.agents.verifier import VerifierAgent
+from app.agents.verifier import VerificationDisposition, VerifierAgent
 from app.schemas.verification import VerificationResult
 from app.core.logging import get_logger
 
 logger = get_logger("verification")
+
+_STATUS_BY_DISPOSITION = {
+    VerificationDisposition.CONFIRMED: "CONFIRMED_VULNERABILITY",
+    VerificationDisposition.REFUTED: "FALSE_POSITIVE",
+    VerificationDisposition.INCONCLUSIVE: "INCONCLUSIVE",
+}
 
 
 class VerificationService:
@@ -37,17 +46,20 @@ class VerificationService:
             attack_result = (await session.execute(result_stmt)).scalars().first()
             target_response = attack_result.target_response if attack_result else ""
 
+            # Independence (E-09): only the raw attack prompt and the target's
+            # response are handed to the verifier — never the evaluator's verdict.
             verdict = await self.verifier_agent.verify(
                 attack_prompt=attack.prompt_text,
                 target_response=target_response,
-                evaluator_reasoning=vuln.reasoning,
             )
 
-            new_status = (
-                "CONFIRMED_VULNERABILITY" if verdict.is_confirmed else "FALSE_POSITIVE"
-            )
+            new_status = _STATUS_BY_DISPOSITION[verdict.disposition]
+            now = datetime.now(timezone.utc)
             vuln.verified_status = new_status
-            vuln.reasoning = f"{vuln.reasoning} | Verification: {verdict.reasoning}"
+            vuln.verification_reasoning = verdict.reasoning
+            vuln.remediation_guidance = verdict.remediation_guidance
+            vuln.verifier_confidence = verdict.confidence
+            vuln.verified_at = now
             await session.commit()
             await session.refresh(vuln)
 
@@ -58,6 +70,8 @@ class VerificationService:
                     "vulnerability_id": str(vuln.id),
                     "campaign_id": str(vuln.experiment_id),
                     "status": new_status,
+                    "disposition": verdict.disposition.value,
+                    "confidence": verdict.confidence,
                 },
             )
 
@@ -65,7 +79,5 @@ class VerificationService:
                 vulnerability_id=vuln.id,
                 verified_status=new_status,
                 verification_reasoning=verdict.reasoning,
-                remediation_guidance=(
-                    verdict.remediation_guidance if verdict.is_confirmed else None
-                ),
+                remediation_guidance=verdict.remediation_guidance,
             )

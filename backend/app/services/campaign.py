@@ -236,6 +236,11 @@ class CampaignOrchestrator:
                             )
                         except Exception:
                             verified = None
+                        confirmed = bool(
+                            verified
+                            and verified.verified_status
+                            == "CONFIRMED_VULNERABILITY"
+                        )
                         await self._record_agent_run(
                             config.experiment_id,
                             "verifier",
@@ -243,7 +248,25 @@ class CampaignOrchestrator:
                                 "round": round_num,
                                 "attack_id": str(attack.id),
                                 "vulnerability_id": str(eval_summary.vulnerability_id),
-                                "confirmed": bool(verified and verified.verified_status == "CONFIRMED_VULNERABILITY"),
+                                "verified_status": (
+                                    verified.verified_status if verified else "ERROR"
+                                ),
+                                "agreement": confirmed,
+                            },
+                        )
+                        logger.info(
+                            "Evaluator-verifier agreement recorded",
+                            extra={
+                                "event_name": "verification.agreement",
+                                "campaign_id": str(config.experiment_id),
+                                "vulnerability_id": str(
+                                    eval_summary.vulnerability_id
+                                ),
+                                "evaluator_verdict": "JAILBREAK",
+                                "verifier_status": (
+                                    verified.verified_status if verified else "ERROR"
+                                ),
+                                "agreement": confirmed,
                             },
                         )
 
@@ -317,7 +340,12 @@ class CampaignOrchestrator:
                                             "vulnerability_id": str(
                                                 mutated_eval.vulnerability_id
                                             ),
-                                            "confirmed": bool(
+                                            "verified_status": (
+                                                verified.verified_status
+                                                if verified
+                                                else "ERROR"
+                                            ),
+                                            "agreement": bool(
                                                 verified
                                                 and verified.verified_status
                                                 == "CONFIRMED_VULNERABILITY"

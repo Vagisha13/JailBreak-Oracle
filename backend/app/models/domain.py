@@ -165,6 +165,20 @@ class Vulnerability(Base, BaseMixin):
     verified_status: Mapped[str] = mapped_column(
         String(50), default="UNCONFIRMED", index=True
     )
+    # Persisted independent-verifier fields (E-09). Populated when the
+    # vulnerability is put through dual verification.
+    verification_reasoning: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    remediation_guidance: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    verifier_confidence: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )
+    verified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )

@@ -234,3 +234,18 @@ New tests: `tests/test_stateful_campaign.py` (4) — full conversation-history c
 | RAG wiring | Attacker RAG is now scoped to the active campaign (`experiment_id`). `generate_mutated_attack` additionally retrieves up to 2 *successful* same-strategy prior lines and appends them as "SUCCESSFUL PRIOR LINES" learning context so mutations build on what already landed. |
 
 New tests: `tests/test_memory_honest.py` (6) — relevance-not-recency ranking, honest empty result on zero overlap, status filters (successful/failed), strategy filter + invalid-status rejection, facade SQLite resolution, and mutation-time successful-prior-lines context.
+
+---
+
+## 13. Phase 6 — Structured evaluator/verifier outputs (2026-09-06)
+
+**87/87 tests pass.** Lint + typecheck gates green.
+
+| Issue | Resolution |
+|---|---|
+| E-10 | `EvaluatorVerdict` is now structured: `verdict` is a `VerdictType` enum (`JAILBREAK`/`AMBIGUOUS`/`BLOCKED`), `severity` is `Literal`-constrained, `confidence` is `ge=0.0/le=1.0`, and fields `evidence` + `false_positive_indicators` are collected. `is_jailbreak` is retained as a derived convenience kept consistent by a `model_validator` (either input shape works). Evaluator prompt now requests the structured schema incl. `AMBIGUOUS`. |
+| E-09 independence | `VerifierAgent.verify` no longer accepts evaluator reasoning — the second opinion sees only the raw attack prompt + target response. Structured `VerificationDisposition` (`CONFIRMED`/`REFUTED`/`INCONCLUSIVE`) with `verdict.confidence` and `evidence`; `is_confirmed` kept as back-compat derived flag. |
+| E-09 persistence | Migration `d4e2b0c9a3g8_verifier_fields` adds `verification_reasoning`, `remediation_guidance`, `verifier_confidence`, `verified_at` to `vulnerabilities` (SQLite-safe batch; upgrade/downgrade round-trip + schema parity verified). `VerificationService` persists all verifier fields and maps `CONFIRMED→CONFIRMED_VULNERABILITY`, `REFUTED→FALSE_POSITIVE`, `INCONCLUSIVE→INCONCLUSIVE` — evaluator reasoning is no longer mutated. |
+| Agreement | Orchestrator records evaluator↔verifier agreement in verifier `AgentRun` telemetry (`verified_status` + `agreement`) and emits a structured `verification.agreement` event on every confirmed path (primary + mutated). |
+
+New tests: `tests/test_structured_outputs.py` (8) — verdict derivation both ways, `AMBIGUOUS` semantics, severity/confidence constraint rejection, structured evaluator prompt, verifier independence (prompt must not contain evaluator reasoning), disposition→status mapping, persisted verifier fields, and `INCONCLUSIVE` persistence. Migration round-trip verified on a fresh SQLite DB.
