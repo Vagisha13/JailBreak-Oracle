@@ -220,3 +220,17 @@ Architecture notes: orchestrator stores `MutationEngine` internally (from the at
 | Worker restart recovery | `app/worker.py::recover_stale_campaigns` now reverts stale RUNNING experiments to PENDING and re-queues them (key `resumed_running`), so a worker crash resumes a campaign from its DB round state instead of permanently failing it. Resumed IDs are excluded from the "very old PENDING → FAILED" sweep on the same pass. |
 
 New tests: `tests/test_stateful_campaign.py` (4) — full conversation-history chaining, adaptive-mutation turn-depth, cross-run resume continuity, and `AgentRun` telemetry shape. Updated `tests/test_campaign_lifecycle.py` for the RUNNING→PENDING resume semantics.
+
+---
+
+## 12. Phase 5 — Honest memory & retrieval filters (2026-09-06)
+
+**79/79 tests pass.** Lint + typecheck gates green.
+
+| Issue | Resolution |
+|---|---|
+| E-13 | `app/services/memory.py` now exposes the explicit `AttackMemory` interface with two backend implementations. `VectorMemoryService` keeps the pgvector `<=>` path; `KeywordMemoryService` is the **honest** SQLite fallback — it logs a startup warning and ranks attacks by Jaccard query-token overlap instead of silently presenting "last N attacks" as retrieval. Zero-overlap queries return empty results rather than recency soup, and `embed_attack` is a documented no-op (no embeddings faked/persisted without pgvector). `MemoryService` remains as a facade over a cached `is_pgvector_available()` probe, preserving all call sites. |
+| Retrieval filters | `retrieve_similar_attacks` gained `status` (`"successful"` = has recorded vulnerability / `"failed"`) and `strategy_name` filters in both backends; `MemoryService.dispatcher`/vector SQL build WHERE clauses accordingly; invalid status values raise `ValueError`. |
+| RAG wiring | Attacker RAG is now scoped to the active campaign (`experiment_id`). `generate_mutated_attack` additionally retrieves up to 2 *successful* same-strategy prior lines and appends them as "SUCCESSFUL PRIOR LINES" learning context so mutations build on what already landed. |
+
+New tests: `tests/test_memory_honest.py` (6) — relevance-not-recency ranking, honest empty result on zero overlap, status filters (successful/failed), strategy filter + invalid-status rejection, facade SQLite resolution, and mutation-time successful-prior-lines context.

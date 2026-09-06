@@ -99,7 +99,7 @@ class AttackerAgent:
         context_str = ""
         if self.memory_service:
             past_attacks = await self.memory_service.retrieve_similar_attacks(
-                objective, limit=3
+                objective, limit=3, experiment_id=experiment_id
             )
             if past_attacks:
                 context_str = "\nPREVIOUS ATTEMPTS (Learn from these):\n"
@@ -169,6 +169,25 @@ class AttackerAgent:
         sys_prompt = strategy.get_mutation_prompt(
             objective, last_attack, feedback, conversation_history=conversation
         )
+
+        # LEARN: attach successful prior lines for this strategy so mutations
+        # build on what already landed, not just on what was blocked.
+        if self.memory_service:
+            successful_prior = await self.memory_service.retrieve_similar_attacks(
+                objective,
+                limit=2,
+                experiment_id=experiment_id,
+                status="successful",
+                strategy_name=strategy.name,
+            )
+            if successful_prior:
+                prior_lines = "\n".join(
+                    f"- {pa['prompt_text']}" for pa in successful_prior
+                )
+                sys_prompt += (
+                    "\n\nSUCCESSFUL PRIOR LINES (learn from these):\n"
+                    f"{prior_lines}"
+                )
         response = await self.provider.execute(sys_prompt, {"temperature": 0.8})
 
         if response.error:
