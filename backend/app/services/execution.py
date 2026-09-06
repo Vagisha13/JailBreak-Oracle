@@ -4,6 +4,9 @@ from app.db.session import AsyncSessionLocal
 from app.models.domain import Attack, Target, AttackResult
 from app.targets.factory import TargetFactory
 from app.schemas.execution import ExecutionSummary
+from app.core.logging import get_logger
+
+logger = get_logger("execution")
 
 
 class ExecutionService:
@@ -57,13 +60,34 @@ class ExecutionService:
             "total_tokens": target_response.total_tokens,
         }
 
-        return await self._persist_result(
+        result = await self._persist_result(
             attack_id=attack_id,
             response_text=target_response.response_text,
             latency_ms=target_response.latency_ms,
             token_usage=token_json,
             error_message=target_response.error,
         )
+
+        if target_response.error:
+            logger.warning(
+                "Attack execution returned provider error",
+                extra={
+                    "event_name": "execution.provider_error",
+                    "attack_id": str(attack_id),
+                    "provider": target_provider_type,
+                },
+            )
+        else:
+            logger.info(
+                "Attack executed",
+                extra={
+                    "event_name": "execution.attack_executed",
+                    "attack_id": str(attack_id),
+                    "provider": target_provider_type,
+                    "latency_ms": result.latency_ms,
+                },
+            )
+        return result
 
     async def _persist_result(
         self,

@@ -2,95 +2,153 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Plus, RefreshCcw } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { Plus, RefreshCcw, Loader2 } from "lucide-react";
 import { api } from "@/lib/api";
-import { Campaign } from "@/lib/types";
+import { useAuth } from "@/lib/auth";
+import { StatusBadge } from "@/components/StatusBadge";
+import { ErrorState } from "@/components/ErrorState";
+import { EmptyState } from "@/components/EmptyState";
+import type { Campaign } from "@/lib/types";
 
 export default function CampaignsPage() {
+  const router = useRouter();
+  const { isAuthenticated, loading: authLoading } = useAuth();
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!authLoading && !isAuthenticated) router.push("/login");
+  }, [authLoading, isAuthenticated, router]);
 
   const fetchCampaigns = async () => {
     setLoading(true);
+    setError("");
     try {
       const res = await api.get<Campaign[]>("/campaigns");
       setCampaigns(res.data);
-    } catch (error) {
-      console.error("Failed to fetch campaigns:", error);
+    } catch {
+      setError("Failed to load campaigns. Backend may be unreachable.");
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    fetchCampaigns();
-  }, []);
+    if (!isAuthenticated) return;
+    let active = true;
+    const run = async () => {
+      setLoading(true);
+      setError("");
+      try {
+        const res = await api.get<Campaign[]>("/campaigns");
+        if (active) setCampaigns(res.data);
+      } catch {
+        if (active) setError("Failed to load campaigns. Backend may be unreachable.");
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+    run();
+    return () => {
+      active = false;
+    };
+  }, [isAuthenticated]);
+
+  if (authLoading || !isAuthenticated) {
+    return (
+      <div className="flex items-center justify-center py-32">
+        <Loader2 className="w-6 h-6 text-cyan-400 animate-spin" />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div>
-          <h2 className="text-3xl font-bold tracking-tight text-slate-900">Campaigns</h2>
-          <p className="text-slate-500 mt-2">Manage and monitor automated red teaming experiments.</p>
+          <h2 className="text-3xl font-bold tracking-tight text-white">Campaigns</h2>
+          <p className="text-slate-400 mt-1 text-sm">
+            Manage and monitor automated red teaming experiments.
+          </p>
         </div>
-        <div className="flex gap-3">
-          <button 
-            onClick={fetchCampaigns}
-            className="px-4 py-2 bg-white border border-slate-200 text-slate-700 rounded-lg hover:bg-slate-50 flex items-center gap-2 text-sm font-medium transition-colors"
-          >
-            <RefreshCcw className="w-4 h-4" /> Refresh
+        <div className="flex gap-2">
+          <button onClick={fetchCampaigns} className="btn-secondary">
+            <RefreshCcw className="w-3.5 h-3.5" /> Refresh
           </button>
-          <Link 
-            href="/campaigns/new"
-            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-2 text-sm font-medium transition-colors"
-          >
-            <Plus className="w-4 h-4" /> New Campaign
+          <Link href="/campaigns/new" className="btn-primary">
+            <Plus className="w-3.5 h-3.5" /> New Campaign
           </Link>
         </div>
       </div>
 
-      <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
-        <table className="min-w-full divide-y divide-slate-200">
-          <thead className="bg-slate-50">
-            <tr>
-              <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">Name</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">Status</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">Budget</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">Created</th>
-            </tr>
-          </thead>
-          <tbody className="bg-white divide-y divide-slate-200">
-            {loading ? (
-              <tr>
-                <td colSpan={4} className="px-6 py-8 text-center text-sm text-slate-500">Loading campaigns...</td>
+      {error && <ErrorState message={error} onRetry={fetchCampaigns} />}
+
+      {!error && (
+        <div className="card overflow-hidden">
+          <table className="min-w-full">
+            <thead>
+              <tr className="border-b border-slate-800">
+                <th className="px-6 py-3 text-left text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Name</th>
+                <th className="px-6 py-3 text-left text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Status</th>
+                <th className="px-6 py-3 text-left text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Budget</th>
+                <th className="px-6 py-3 text-left text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Created</th>
+                <th className="px-6 py-3 text-right text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Actions</th>
               </tr>
-            ) : campaigns.length === 0 ? (
-              <tr>
-                <td colSpan={4} className="px-6 py-8 text-center text-sm text-slate-500">No campaigns found. Create one to get started.</td>
-              </tr>
-            ) : (
-              campaigns.map((camp) => (
-                <tr key={camp.id} className="hover:bg-slate-50 transition-colors">
-                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-slate-900">{camp.name}</td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm">
-                    <span className={`px-2.5 py-1 rounded-full text-xs font-medium ${
-                      camp.status === 'COMPLETED' ? 'bg-emerald-100 text-emerald-800' :
-                      camp.status === 'RUNNING' ? 'bg-blue-100 text-blue-800' :
-                      'bg-slate-100 text-slate-800'
-                    }`}>
-                      {camp.status}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">{camp.attack_budget} requests</td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">
-                    {new Date(camp.created_at).toLocaleString()}
+            </thead>
+            <tbody className="divide-y divide-slate-800/50">
+              {loading ? (
+                <tr>
+                  <td colSpan={5} className="px-6 py-12 text-center">
+                    <Loader2 className="w-5 h-5 text-cyan-400 animate-spin mx-auto" />
                   </td>
                 </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
+              ) : campaigns.length === 0 ? (
+                <tr>
+                  <td colSpan={5}>
+                    <EmptyState
+                      message="No campaigns found. Create one to start red teaming."
+                      action={
+                        <Link href="/campaigns/new" className="btn-primary">
+                          <Plus className="w-3.5 h-3.5" /> New Campaign
+                        </Link>
+                      }
+                    />
+                  </td>
+                </tr>
+              ) : (
+                campaigns.map((camp) => (
+                  <tr key={camp.id} className="hover:bg-slate-800/20 transition-colors">
+                    <td className="px-6 py-3.5">
+                      <Link href={`/campaigns/${camp.id}`} className="text-sm font-medium text-slate-200 hover:text-cyan-400 transition-colors">
+                        {camp.name}
+                      </Link>
+                    </td>
+                    <td className="px-6 py-3.5">
+                      <StatusBadge status={camp.status} />
+                    </td>
+                    <td className="px-6 py-3.5 text-sm text-slate-400">
+                      {camp.attack_budget}
+                    </td>
+                    <td className="px-6 py-3.5 text-sm text-slate-500">
+                      {camp.created_at ? new Date(camp.created_at).toLocaleString() : "-"}
+                    </td>
+                    <td className="px-6 py-3.5 text-right">
+                      <Link
+                        href={`/campaigns/${camp.id}`}
+                        className="text-xs text-cyan-400 hover:text-cyan-300 font-medium transition-colors"
+                      >
+                        View
+                      </Link>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

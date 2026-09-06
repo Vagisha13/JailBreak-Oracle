@@ -1,7 +1,6 @@
 import pytest
 import uuid
 import json
-from httpx import AsyncClient, ASGITransport
 from sqlalchemy.future import select
 from app.main import app
 from app.db.session import AsyncSessionLocal
@@ -109,13 +108,14 @@ async def test_verification_service_workflow():
 
 
 @pytest.mark.asyncio
-async def test_vulnerability_api_endpoints():
+async def test_vulnerability_api_endpoints(api_client):
     async with AsyncSessionLocal() as session:
         user = User(email=f"verify_api_{uuid.uuid4()}@oracle.sec", hashed_password="pw")
         session.add(user)
         await session.commit()
+        user_id = user.id
 
-        project = Project(name="Verify API Proj", owner_id=user.id)
+        project = Project(name="Verify API Proj", owner_id=user_id)
         session.add(project)
         await session.commit()
 
@@ -159,14 +159,33 @@ async def test_vulnerability_api_endpoints():
         await session.commit()
         vuln_id = str(vuln.id)
 
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        get_res = await client.get(f"/api/v1/vulnerabilities/{vuln_id}")
+    from app.core.auth import create_access_token
+
+    token = create_access_token({"sub": str(user_id)})
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Override the dependency to use our mock verifier
+    def mock_get_verification_service():
+        provider = MockVerifierProvider()
+        verifier_agent = VerifierAgent(provider=provider)
+        return VerificationService(verifier_agent=verifier_agent)
+
+    from app.api.routers import vulnerabilities as vuln_router
+    app.dependency_overrides[vuln_router.get_verification_service] = mock_get_verification_service
+
+    try:
+        get_res = await api_client.get(
+            f"/api/v1/vulnerabilities/{vuln_id}", headers=headers
+        )
         assert get_res.status_code == 200
         assert get_res.json()["verified_status"] == "UNCONFIRMED"
 
-        verify_res = await client.post(
-            "/api/v1/vulnerabilities/verify", json={"vulnerability_id": vuln_id}
+        verify_res = await api_client.post(
+            "/api/v1/vulnerabilities/verify",
+            json={"vulnerability_id": vuln_id},
+            headers=headers,
         )
         assert verify_res.status_code == 200
         assert verify_res.json()["verified_status"] == "CONFIRMED_VULNERABILITY"
+    finally:
+        app.dependency_overrides.clear()

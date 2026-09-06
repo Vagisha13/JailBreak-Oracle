@@ -10,7 +10,7 @@ from app.core.config import settings
 
 DATABASE_URL = settings.ASYNC_DATABASE_URL
 
-engine_kwargs = {
+engine_kwargs: dict[str, object] = {
     "echo": False,
     "future": True,
 }

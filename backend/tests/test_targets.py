@@ -33,4 +33,4 @@ def test_target_factory_unsupported_provider():
     with pytest.raises(ValueError) as excinfo:
         TargetFactory.get_provider("unsupported_provider_name")
 
-    assert "Unsupported provider_type" in str(excinfo.value)
+    assert "Unsupported target provider type" in str(excinfo.value)

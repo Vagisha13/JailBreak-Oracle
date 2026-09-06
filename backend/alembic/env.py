@@ -40,13 +40,13 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        # Ensure pgvector extension exists before creating tables
-        connection.execute(
-            target_metadata.schema_subject
-            if hasattr(target_metadata, "schema_subject")
-            else __import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS vector;")
-        )
-        connection.commit()
+        # pgvector is required for the `attacks.embedding` column. CREATE
+        # EXTENSION is PostgreSQL-only; SQLite (dev/tests) has no extensions.
+        if connection.dialect.name == "postgresql":
+            connection.execute(
+                __import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS vector;")
+            )
+            connection.commit()
 
         context.configure(connection=connection, target_metadata=target_metadata)
 

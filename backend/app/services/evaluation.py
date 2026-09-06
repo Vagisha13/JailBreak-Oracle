@@ -5,6 +5,9 @@ from app.models.domain import AttackResult, Attack, Vulnerability
 from app.schemas.evaluation import EvaluationResult, EvaluatorVerdict
 from app.services.heuristics import HeuristicEngine
 from app.agents.evaluator import EvaluatorAgent
+from app.core.logging import get_logger
+
+logger = get_logger("evaluation")
 
 
 class EvaluationService:
@@ -72,6 +75,16 @@ class EvaluationService:
                 await session.commit()
                 await session.refresh(vuln)
                 vulnerability_id = vuln.id
+                logger.info(
+                    "Jailbreak vulnerability recorded",
+                    extra={
+                        "event_name": "evaluation.vulnerability_recorded",
+                        "attack_id": str(attack.id),
+                        "campaign_id": str(attack.experiment_id),
+                        "vulnerability_id": str(vuln.id),
+                        "severity": verdict.severity,
+                    },
+                )
 
             return EvaluationResult(
                 attack_id=attack.id,

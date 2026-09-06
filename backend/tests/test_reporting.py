@@ -1,7 +1,5 @@
 import pytest
 import uuid
-from httpx import AsyncClient, ASGITransport
-from app.main import app
 from app.db.session import AsyncSessionLocal
 from app.models.domain import (
     User,
@@ -9,7 +7,6 @@ from app.models.domain import (
     Target,
     Experiment,
     Attack,
-    AttackResult,
     Vulnerability,
 )
 from app.services.report import ReportService
@@ -84,13 +81,14 @@ async def test_report_service_calculation():
 
 
 @pytest.mark.asyncio
-async def test_report_api_endpoint():
+async def test_report_api_endpoint(api_client):
     async with AsyncSessionLocal() as session:
         user = User(email=f"report_api_{uuid.uuid4()}@oracle.sec", hashed_password="pw")
         session.add(user)
         await session.commit()
+        user_id = user.id
 
-        project = Project(name="Report API Proj", owner_id=user.id)
+        project = Project(name="Report API Proj", owner_id=user_id)
         session.add(project)
         await session.commit()
 
@@ -107,11 +105,14 @@ async def test_report_api_endpoint():
         await session.commit()
         exp_id = str(exp.id)
 
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        res = await client.get(f"/api/v1/reports/experiment/{exp_id}")
-        assert res.status_code == 200
-        data = res.json()
-        assert data["experiment_id"] == exp_id
-        assert "overall_risk_score" in data
-        assert "severity_breakdown" in data
+    from app.core.auth import create_access_token
+
+    token = create_access_token({"sub": str(user_id)})
+    headers = {"Authorization": f"Bearer {token}"}
+
+    res = await api_client.get(f"/api/v1/reports/experiment/{exp_id}", headers=headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["experiment_id"] == exp_id
+    assert "overall_risk_score" in data
+    assert "severity_breakdown" in data

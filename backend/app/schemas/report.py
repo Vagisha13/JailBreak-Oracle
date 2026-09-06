@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional
+from typing import List
 
 
 class SeverityBreakdown(BaseModel):

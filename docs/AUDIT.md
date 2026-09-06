@@ -148,3 +148,24 @@ Severity: **Critical** (data loss/security/schema corruption) · **High** (behav
 | Orphan tables: `analytics_reports`, `model_calls`, `defenses`, `regression_tests`, `defense_tests` | No ORM models reference them | Drop from regenerated migration (recreate properly in Phases 6–7 when real features land) |
 | `settings.MAX_CAMPAIGN_COST`, `DEFAULT_MAX_ROUNDS`, `DEFAULT_ATTACK_BUDGET` | Never read by code | Keep (used by Phase 8) or document |
 | `api/access.py: experiment_belongs_to_user`, `auth.get_current_user_optional` | Unused | Remove or document as conveniences |
+
+---
+
+## 8. Phase 1 — Foundation & CI (2026-09-06)
+
+Resolved the onboarding, safety and tooling issues from Phase 0. **60/60 tests still pass.**
+
+| Phase 0 issue | Resolution |
+|---|---|
+| E-01 (Critical) | `backend/tests/conftest.py` now redirects the engine to an **isolated temp SQLite DB** before any app module is imported. Honors `TEST_DATABASE_URL` when set (e.g. dedicated PG test instance in CI). Dev `oracle.db` is never touched. |
+| E-03 (High) | `app/main.py` lifespan: `create_all` runs **only** in non-production environments. Production verifies the schema exists (via `inspect.has_table("experiments")`) and raises a clear error telling the operator to run `alembic upgrade head`. |
+| E-04 (Critical) | `alembic/env.py` now guards `CREATE EXTENSION vector` behind `dialect.name == "postgresql"` so migrations run cleanly on SQLite and PostgreSQL. Migration rewrite (ORM-synced + orphan-table cleanup) is staged in the same commit defining Phase 2. |
+| E-18 (Low) | `backend/main.py` is now a thin deprecated alias of `app.main` (emits `DeprecationWarning`); `tests/test_health.py` targets the canonical app. |
+| E-19 (Low) | Swapped `black` for `mypy==1.9.0` in `requirements.txt`; added `backend/.flake8` (120-col) and `backend/mypy.ini`; fixed **every** flake8 finding (unused imports, unused locals, missing newline-at-EOF, an `F811` shadow) and **all 7** mypy findings (implicit `Optional`, untyped engine kwargs, `object`-typed Redis client, reassignment typing). |
+| E-17 (High) | Root `Makefile` (setup/test/lint/typecheck/check/api/worker/migrate/compose targets) and `.github/workflows/ci.yml` (backend lint + typecheck + tests on Ubuntu/Python 3.11; frontend lint + build on Node 20). |
+| E-02 (High) | Documented one-command setup via `make setup`; committed `backend/venv` remains broken and is gitignored — see `Makefile`. |
+
+New tooling commands (run from repo root): `make lint`, `make typecheck`, `make check` (lint+typecheck+test), `make test`.
+New `make check` is the exact CI entrypoint for backend so local == CI.
+
+Open items carried into Phase 2: regenerated ORM-synced migration + orphan-table drop, verifier unification (E-05), and the full docker-compose app stack. Root `README.md` deliberately deferred past Phase 1 (E-17 partial).

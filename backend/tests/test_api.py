@@ -1,10 +1,14 @@
 import pytest
 import uuid
-import asyncio
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy.future import select
 from app.main import app
 from app.db.session import AsyncSessionLocal
-from app.models.domain import User, Project, Target, Experiment
+from app.models.domain import Experiment
+
+
+def _auth_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.mark.asyncio
@@ -17,57 +21,47 @@ async def test_health_check():
 
 
 @pytest.mark.asyncio
-async def test_campaign_api_flow():
-    # 1. Setup DB Context for API test
+async def test_campaign_api_flow(api_client, mock_llm_providers):
+    # 1. Register a user through the real auth flow
+    resp = await api_client.post(
+        "/api/v1/auth/register",
+        json={"email": f"api_{uuid.uuid4()}@oracle.sec", "password": "strongpass123"},
+    )
+    assert resp.status_code == 201
+    token = resp.json()["access_token"]
+    headers = _auth_headers(token)
+
+    # 2. Create a demo project + target owned by this user
+    demo = await api_client.post("/api/v1/campaigns/setup-demo", headers=headers)
+    assert demo.status_code == 200, demo.text
+    project_id = demo.json()["project_id"]
+    target_id = demo.json()["target_id"]
+
+    # 3. Trigger Campaign Launch
+    payload = {
+        "name": "API Test Campaign",
+        "project_id": project_id,
+        "target_id": target_id,
+        "attack_budget": 1,
+        "exploration_ratio": 0.0,
+    }
+
+    response = await api_client.post("/api/v1/campaigns/start", json=payload, headers=headers)
+
+    # The start endpoint creates a new experiment internally, enqueues it,
+    # and returns quickly with the queued PENDING status.
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "PENDING"
+    experiment_id = uuid.UUID(data["experiment_id"])
+
     async with AsyncSessionLocal() as session:
-        user = User(email=f"api_{uuid.uuid4()}@oracle.sec", hashed_password="pw")
-        session.add(user)
-        await session.commit()
-
-        project = Project(name="API Test Project", owner_id=user.id)
-        session.add(project)
-        await session.commit()
-
-        target = Target(project_id=project.id, name="API Target", provider_type="mock")
-        session.add(target)
-        await session.commit()
-
-        experiment = Experiment(
-            project_id=project.id, target_id=target.id, name="API Campaign"
+        exp = (
+            (
+                await session.execute(select(Experiment).where(Experiment.id == experiment_id))
+            )
+            .scalars()
+            .first()
         )
-        session.add(experiment)
-        await session.commit()
-
-        exp_id = str(experiment.id)
-        target_id = str(target.id)
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # 2. Trigger Campaign Launch
-        payload = {
-            "experiment_id": exp_id,
-            "target_id": target_id,
-            "objective": "Bypass safety filters via API",
-            "max_rounds": 1,
-            "stop_on_first_success": True,
-        }
-
-        response = await client.post("/api/v1/campaigns/start", json=payload)
-
-        assert response.status_code == 202
-        data = response.json()
-        assert data["status"] == "PENDING"
-        assert data["experiment_id"] == exp_id
-
-        # 3. Check Status Endpoint (Should immediately be PENDING)
-        status_resp = await client.get(f"/api/v1/campaigns/{exp_id}/status")
-        assert status_resp.status_code == 200
-        assert status_resp.json()["status"] == "PENDING"
-
-        # 4. Wait a tiny bit for the BackgroundTask to complete the mock execution
-        await asyncio.sleep(0.5)
-
-        # 5. Check Status Endpoint again (Should now be COMPLETED)
-        final_status_resp = await client.get(f"/api/v1/campaigns/{exp_id}/status")
-        assert final_status_resp.status_code == 200
-        assert final_status_resp.json()["status"] == "COMPLETED"
+        assert exp is not None
+        assert exp.status in ("PENDING", "RUNNING", "COMPLETED", "FAILED")

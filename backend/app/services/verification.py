@@ -4,6 +4,9 @@ from app.db.session import AsyncSessionLocal
 from app.models.domain import Vulnerability, Attack, AttackResult
 from app.agents.verifier import VerifierAgent
 from app.schemas.verification import VerificationResult
+from app.core.logging import get_logger
+
+logger = get_logger("verification")
 
 
 class VerificationService:
@@ -47,6 +50,16 @@ class VerificationService:
             vuln.reasoning = f"{vuln.reasoning} | Verification: {verdict.reasoning}"
             await session.commit()
             await session.refresh(vuln)
+
+            logger.info(
+                "Vulnerability verification completed",
+                extra={
+                    "event_name": "verification.verdict",
+                    "vulnerability_id": str(vuln.id),
+                    "campaign_id": str(vuln.experiment_id),
+                    "status": new_status,
+                },
+            )
 
             return VerificationResult(
                 vulnerability_id=vuln.id,

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Optional
 import litellm
 
 
@@ -25,7 +25,11 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
     Defaults to standard 1536-dimensional 'text-embedding-3-small'.
     """
 
-    def __init__(self, model_name: str = "text-embedding-3-small", api_key: str = None):
+    def __init__(
+        self,
+        model_name: str = "text-embedding-3-small",
+        api_key: Optional[str] = None,
+    ):
         self.model_name = model_name
         self.api_key = api_key
 

@@ -1,0 +1,209 @@
+"""Redis-backed campaign worker.
+
+Long-running campaign execution is handled by this persistent worker process
+instead of FastAPI ``BackgroundTasks``. The worker reads campaign jobs from a
+Redis queue, executes them, and updates the persisted campaign state:
+
+    PENDING -> RUNNING -> COMPLETED
+    PENDING -> RUNNING -> FAILED
+
+Run with: ``python -m app.worker`` (or the ``worker`` service in Docker).
+
+Guarantees:
+  * A worker crash cannot leave a campaign permanently RUNNING: stale RUNNING
+    campaigns are marked FAILED on startup, and PENDING campaigns are re-queued.
+  * Provider failures mark the campaign FAILED (never stuck RUNNING).
+"""
+import asyncio
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from sqlalchemy.future import select
+
+from app.core.config import settings
+from app.core.logging import get_logger
+from app.db.session import AsyncSessionLocal
+from app.models.domain import Experiment
+from app.services.queue import dequeue_campaign, enqueue_campaign
+
+logger = get_logger("worker")
+
+PENDING_GRACE_SECONDS = 300
+
+
+def _aware(dt: datetime) -> datetime:
+    """Normalize naive DB timestamps to UTC (SQLite drivers drop tzinfo)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def build_orchestrator():
+    """Build the campaign orchestrator used by the worker."""
+    from app.api.deps import get_campaign_orchestrator
+
+    return get_campaign_orchestrator()
+
+
+async def process_campaign_job(experiment_id: uuid.UUID, orchestrator=None) -> str:
+    """Execute a single queued campaign job. Returns the terminal status."""
+    orchestrator = orchestrator or build_orchestrator()
+    logger.info(
+        "Worker processing campaign job",
+        extra={
+            "event_name": "worker.campaign_started",
+            "campaign_id": str(experiment_id),
+        },
+    )
+    try:
+        await orchestrator.run_attack_loop(experiment_id)
+    except Exception as exc:
+        logger.error(
+            "Campaign worker failed",
+            extra={
+                "event_name": "worker.campaign_failed",
+                "campaign_id": str(experiment_id),
+                "error_type": type(exc).__name__,
+            },
+            exc_info=True,
+        )
+        await _mark_failed(experiment_id)
+        return "FAILED"
+
+    status = await _get_status(experiment_id)
+    logger.info(
+        "Campaign worker finished",
+        extra={
+            "event_name": "worker.campaign_finished",
+            "campaign_id": str(experiment_id),
+            "status": status,
+        },
+    )
+    return status or "FAILED"
+
+
+async def _mark_failed(experiment_id: uuid.UUID) -> None:
+    async with AsyncSessionLocal() as session:
+        experiment = (
+            await session.execute(select(Experiment).where(Experiment.id == experiment_id))
+        ).scalars().first()
+        if experiment and experiment.status not in ("COMPLETED", "FAILED"):
+            experiment.status = "FAILED"
+            experiment.finished_at = datetime.now(timezone.utc)
+            await session.commit()
+
+
+async def _get_status(experiment_id: uuid.UUID) -> Optional[str]:
+    async with AsyncSessionLocal() as session:
+        experiment = (
+            await session.execute(select(Experiment).where(Experiment.id == experiment_id))
+        ).scalars().first()
+        return experiment.status if experiment else None
+
+
+async def _mark_stale_running_failed(max_age_seconds: int, now: datetime) -> list[uuid.UUID]:
+    cutoff = now - timedelta(seconds=max_age_seconds)
+    recovered: list[uuid.UUID] = []
+    async with AsyncSessionLocal() as session:
+        stale = (
+            await session.execute(
+                select(Experiment).where(
+                    Experiment.status == "RUNNING",
+                    Experiment.created_at < cutoff,
+                )
+            )
+        ).scalars().all()
+        for experiment in stale:
+            experiment.status = "FAILED"
+            experiment.finished_at = now
+            recovered.append(experiment.id)
+        if stale:
+            await session.commit()
+    return recovered
+
+
+async def recover_stale_campaigns(
+    max_age_seconds: Optional[int] = None, now: Optional[datetime] = None
+) -> dict:
+    """
+    Recovery routine run on worker startup:
+      1. RUNNING campaigns older than the campaign timeout -> FAILED.
+      2. PENDING campaigns past the re-enqueue grace period -> re-queued.
+      3. PENDING campaigns older than the campaign timeout -> FAILED.
+    """
+    max_age_seconds = max_age_seconds or settings.CAMPAIGN_TIMEOUT_SECONDS
+    now = now or datetime.now(timezone.utc)
+    pid_cutoff = now - timedelta(seconds=max_age_seconds)
+    grace_cutoff = now - timedelta(seconds=PENDING_GRACE_SECONDS)
+
+    failed_running = await _mark_stale_running_failed(max_age_seconds, now)
+
+    re_enqueued: list[uuid.UUID] = []
+    failed_pending: list[uuid.UUID] = []
+
+    async with AsyncSessionLocal() as session:
+        pending = (
+            await session.execute(
+                select(Experiment).where(
+                    Experiment.status == "PENDING",
+                    Experiment.created_at < grace_cutoff,
+                )
+            )
+        ).scalars().all()
+
+        for experiment in pending:
+            if _aware(experiment.created_at) < pid_cutoff:
+                experiment.status = "FAILED"
+                experiment.finished_at = now
+                failed_pending.append(experiment.id)
+        if failed_pending:
+            await session.commit()
+
+    for experiment_id in [e.id for e in pending if e.id not in failed_pending]:
+        if await enqueue_campaign(experiment_id):
+            re_enqueued.append(experiment_id)
+
+    if failed_running or failed_pending or re_enqueued:
+        logger.info(
+            "Recovered stale campaigns",
+            extra={
+                "event_name": "worker.recovery",
+                "num_failed_running": len(failed_running),
+                "num_failed_pending": len(failed_pending),
+                "num_requeued": len(re_enqueued),
+            },
+        )
+
+    return {
+        "failed_running": failed_running,
+        "failed_pending": failed_pending,
+        "requeued": re_enqueued,
+    }
+
+
+async def worker_loop() -> None:
+    """Main worker loop: recover, then pull jobs from the queue forever."""
+    logger.info(
+        "Campaign worker started",
+        extra={"event_name": "worker.started", "queue": "oracle:campaign:jobs"},
+    )
+    await recover_stale_campaigns()
+
+    while True:
+        job = await dequeue_campaign(timeout=5)
+        if job is None:
+            continue
+        await process_campaign_job(job)
+
+
+def main() -> None:
+    """Entrypoint for ``python -m app.worker``."""
+    try:
+        asyncio.run(worker_loop())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Campaign worker stopped", extra={"event_name": "worker.stopped"})
+
+
+if __name__ == "__main__":
+    main()

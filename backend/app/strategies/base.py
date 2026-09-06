@@ -22,6 +22,5 @@ class AttackStrategy(ABC):
         """Returns the system prompt instructing the LLM on how to generate the attack."""
         pass
 
-    @abstractmethod
     def metadata(self) -> dict:
-        pass
+        return {"description": "", "complexity": "unknown"}

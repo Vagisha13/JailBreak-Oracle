@@ -3,13 +3,16 @@ from datetime import datetime, timezone
 from typing import List, Dict
 from sqlalchemy.future import select
 from app.db.session import AsyncSessionLocal
-from app.models.domain import Experiment, Target, Attack, AttackResult, Vulnerability
+from app.models.domain import Experiment, Target, Attack, Vulnerability
 from app.schemas.report import (
     RedTeamReport,
     SeverityBreakdown,
     StrategyPerformance,
     VulnerabilitySummaryItem,
 )
+from app.core.logging import get_logger
+
+logger = get_logger("report")
 
 
 class ReportService:
@@ -116,6 +119,15 @@ class ReportService:
                 "Deploy input pre-filtering classifiers for prompt injection detection.",
                 "Enforce output guardrails to suppress sensitive text exfiltration.",
             ]
+
+            logger.info(
+                "Report generated",
+                extra={
+                    "event_name": "report.generated",
+                    "campaign_id": str(exp.id),
+                    "num_attacks": total_attacks,
+                },
+            )
 
             return RedTeamReport(
                 experiment_id=exp.id,

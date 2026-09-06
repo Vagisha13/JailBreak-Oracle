@@ -2,81 +2,123 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { FileBarChart, RefreshCcw } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { FileBarChart, RefreshCcw, Loader2 } from "lucide-react";
 import { api } from "@/lib/api";
-import { Campaign } from "@/lib/types";
+import { useAuth } from "@/lib/auth";
+import { StatusBadge } from "@/components/StatusBadge";
+import { ErrorState } from "@/components/ErrorState";
+import { EmptyState } from "@/components/EmptyState";
+import type { Campaign } from "@/lib/types";
 
 export default function ReportsListPage() {
+  const router = useRouter();
+  const { isAuthenticated, loading: authLoading } = useAuth();
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!authLoading && !isAuthenticated) router.push("/login");
+  }, [authLoading, isAuthenticated, router]);
 
   const fetchCampaigns = async () => {
     setLoading(true);
+    setError("");
     try {
       const res = await api.get<Campaign[]>("/campaigns");
-      setCampaigns(res.data);
-    } catch (error) {
-      console.error("Failed to fetch campaigns for reports:", error);
+      const completed = res.data.filter((c) => c.status === "COMPLETED");
+      setCampaigns(completed);
+    } catch {
+      setError("Failed to load reports. Backend may be unreachable.");
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    fetchCampaigns();
-  }, []);
+    if (!isAuthenticated) return;
+    let active = true;
+    const run = async () => {
+      setLoading(true);
+      setError("");
+      try {
+        const res = await api.get<Campaign[]>("/campaigns");
+        if (active) {
+          setCampaigns(res.data.filter((c) => c.status === "COMPLETED"));
+        }
+      } catch {
+        if (active) setError("Failed to load reports. Backend may be unreachable.");
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+    run();
+    return () => {
+      active = false;
+    };
+  }, [isAuthenticated]);
+
+  if (authLoading || !isAuthenticated) {
+    return (
+      <div className="flex items-center justify-center py-32">
+        <Loader2 className="w-6 h-6 text-cyan-400 animate-spin" />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div>
-          <h2 className="text-3xl font-bold tracking-tight text-slate-900">Security Reports</h2>
-          <p className="text-slate-500 mt-2">View assessment analytics and vulnerability summaries for your campaigns.</p>
+          <h2 className="text-3xl font-bold tracking-tight text-white">Security Reports</h2>
+          <p className="text-slate-400 mt-1 text-sm">
+            Assessment analytics and vulnerability summaries for completed campaigns.
+          </p>
         </div>
-        <button 
-          onClick={fetchCampaigns}
-          className="px-4 py-2 bg-white border border-slate-200 text-slate-700 rounded-lg hover:bg-slate-50 flex items-center gap-2 text-sm font-medium transition-colors"
-        >
-          <RefreshCcw className="w-4 h-4" /> Refresh
+        <button onClick={fetchCampaigns} className="btn-secondary">
+          <RefreshCcw className="w-3.5 h-3.5" /> Refresh
         </button>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {loading ? (
-          <p className="text-slate-500">Loading available reports...</p>
-        ) : campaigns.length === 0 ? (
-          <p className="text-slate-500">No campaigns found. Start a campaign to generate a report.</p>
-        ) : (
-          campaigns.map((camp) => (
-            <div key={camp.id} className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex flex-col">
-              <div className="flex justify-between items-start mb-4">
-                <div className="p-3 bg-indigo-50 text-indigo-600 rounded-lg">
-                  <FileBarChart className="w-6 h-6" />
-                </div>
-                <span className={`px-2.5 py-1 rounded-full text-xs font-medium ${
-                  camp.status === 'COMPLETED' ? 'bg-emerald-100 text-emerald-800' :
-                  camp.status === 'RUNNING' ? 'bg-blue-100 text-blue-800' :
-                  'bg-slate-100 text-slate-800'
-                }`}>
-                  {camp.status}
-                </span>
-              </div>
-              
-              <h3 className="text-lg font-semibold text-slate-900 mb-1">{camp.name}</h3>
-              <p className="text-sm text-slate-500 mb-6">Generated: {new Date(camp.created_at).toLocaleDateString()}</p>
-              
-              <div className="mt-auto pt-4 border-t border-slate-100">
-                <Link 
-                  href={`/reports/${camp.id}`}
-                  className="w-full py-2 bg-slate-900 text-white rounded-lg hover:bg-slate-800 flex justify-center items-center text-sm font-medium transition-colors"
-                >
-                  View Full Report
-                </Link>
-              </div>
+      {error && <ErrorState message={error} onRetry={fetchCampaigns} />}
+
+      {!error && (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {loading ? (
+            <div className="col-span-full py-12 flex justify-center">
+              <Loader2 className="w-5 h-5 text-cyan-400 animate-spin" />
             </div>
-          ))
-        )}
-      </div>
+          ) : campaigns.length === 0 ? (
+            <div className="col-span-full">
+              <EmptyState message="No completed campaigns yet. Finish a campaign to generate a report." />
+            </div>
+          ) : (
+            campaigns.map((camp) => (
+              <div key={camp.id} className="card p-5 flex flex-col">
+                <div className="flex justify-between items-start mb-4">
+                  <div className="p-2.5 bg-violet-500/10 border border-violet-500/20 rounded-lg">
+                    <FileBarChart className="w-5 h-5 text-violet-400" />
+                  </div>
+                  <StatusBadge status={camp.status} />
+                </div>
+                <h3 className="text-base font-semibold text-slate-200 mb-1 truncate">{camp.name}</h3>
+                <p className="text-xs text-slate-500 mb-5">
+                  {camp.created_at ? new Date(camp.created_at).toLocaleString() : "Unknown"}
+                </p>
+                <div className="mt-auto pt-4 border-t border-slate-800">
+                  <Link
+                    href={`/reports/${camp.id}`}
+                    className="block w-full py-2 bg-slate-800 text-slate-200 rounded-lg hover:bg-slate-700 text-center text-sm font-medium transition-colors"
+                  >
+                    View Full Report
+                  </Link>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      )}
     </div>
   );
 }

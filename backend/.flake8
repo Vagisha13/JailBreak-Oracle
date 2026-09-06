@@ -1,0 +1,6 @@
+[flake8]
+# The codebase follows a 120-char line convention (matches black).
+max-line-length = 120
+extend-ignore = E203, W503
+extend-exclude = venv, .venv, node_modules, .pytest_cache
+per-file-ignores = tests/*:E402
