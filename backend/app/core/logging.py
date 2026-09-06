@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -19,10 +20,17 @@ _SAFE_CONTEXT_FIELDS = (
     "status",
     "provider",
     "model",
+    "role",
     "attempt",
     "error_type",
     "error_id",
+    "error_message",
     "latency_ms",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "transient",
+    "path",
     "queue",
     "num_attacks",
 )
@@ -48,20 +56,39 @@ class JsonFormatter(logging.Formatter):
 
 
 class MaskingFormatter(JsonFormatter):
-    """Formatter that redacts known secret patterns before emitting logs."""
+    """Formatter that redacts known secret constructs before emitting logs.
 
-    _SECRET_PATTERNS = (
-        ("sk-", "sk-***"),
-        ("api_key", "api_key=***"),
-        ("password", "password=***"),
+    A single compiled regex masks each complete secret (``key=value``,
+    ``Bearer <token>``, ``sk-...``, JWT ``eyJ...`` headers) in one pass, so a
+    redacted value can never re-trigger a sibling rule (e.g. ``x-api-key``
+    would otherwise re-match ``api-key`` inside its own replacement output).
+    """
+
+    # Each alternative consumes the *full* construct it detects. Key names are
+    # matched case-insensitively; values stop at any whitespace/quote so JSON
+    # payloads and query-style strings are both handled.
+    _SECRET_PATTERN_RE = re.compile(
+        r"(?i)"
+        r"((?:api[_-]?key|x-api-key|client[_-]?secret|access_token|refresh_token|"
+        r"auth_token|authorization|password|private[_-]?key|secret|bearer_token))"
+        r"\s*[=:]\s*[\"']?[^\s\"',;]+"
+        r"|(Bearer\s+[A-Za-z0-9._/\-+]+)"
+        r"|(sk-[A-Za-z0-9_\-]+)"
+        r"|(eyJ[A-Za-z0-9_\-]{8,})"
     )
+
+    def _redact(self, match: re.Match) -> str:
+        if match.group(1):
+            return f"{match.group(1)}=***"
+        if match.group(2):
+            return "Bearer ***"
+        if match.group(3):
+            return "sk-***"
+        return "eyJ***"
 
     def format(self, record: logging.LogRecord) -> str:
         formatted = super().format(record)
-        for needle, replacement in self._SECRET_PATTERNS:
-            if needle in formatted:
-                formatted = formatted.replace(needle, replacement)
-        return formatted
+        return self._SECRET_PATTERN_RE.sub(self._redact, formatted)
 
 
 _configured_loggers: Dict[str, logging.Logger] = {}

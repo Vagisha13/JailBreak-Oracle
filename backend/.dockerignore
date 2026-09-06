@@ -1,0 +1,27 @@
+# Local artifacts that must never enter the backend image.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+oracle.db
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
+.tmp/
+conftest.py
+pytest.ini
+mypy.ini
+.flake8
+requirements.txt
+Dockerfile
+.dockerignore
+benchmark-report.json
+benchmark-report.csv

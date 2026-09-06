@@ -113,6 +113,19 @@ class LiteLLMTargetProvider(TargetProvider):
                 completion_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
                 total_tokens = getattr(usage, "total_tokens", 0) if usage else 0
 
+                logger.info(
+                    "LLM call succeeded",
+                    extra={
+                        "event_name": "provider.llm_call",
+                        "provider": "litellm",
+                        "model": model,
+                        "latency_ms": round(latency, 2),
+                        "prompt_tokens": prompt_tokens or 0,
+                        "completion_tokens": completion_tokens or 0,
+                        "total_tokens": total_tokens or 0,
+                    },
+                )
+
                 return TargetResponse(
                     response_text=content,
                     latency_ms=latency,

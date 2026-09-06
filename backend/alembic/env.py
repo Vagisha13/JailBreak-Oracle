@@ -14,7 +14,11 @@ config = context.config
 config.set_main_option("sqlalchemy.url", settings.SYNC_DATABASE_URL)
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Never disable already-configured application loggers (e.g. the structured
+    # JSON loggers from app/core/logging.py). Alembic's own template defaults to
+    # disable_existing_loggers=True, which silently kills app log output for the
+    # rest of the process once a migration runs in-process.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

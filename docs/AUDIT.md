@@ -303,3 +303,44 @@ New tests in `tests/test_campaign_lifecycle.py` (4, E-25): `test_running_with_fr
 | New: RBAC | `User.role` is now meaningful. `require_roles(*roles)` dependency factory (401 unauthenticated / 403 wrong role, structured `authx.role_denied` event) backs a new admin-only surface: `GET /api/v1/auth/users` (directory) and `PATCH /api/v1/auth/users/{id}/role` (role assignment; self-demotion returns 400 so the last admin cannot lock everyone out). Registration promotes emails listed in `settings.BOOTSTRAP_ADMIN_EMAILS` (whitespace/case-insensitive) to `admin`; everyone else is `researcher`. |
 
 New tests: `tests/test_authz_admin.py` (10) — bootstrap promotion (case/whitespace), default researcher, admin directory, 401 / 403 guards, promote-success reflected via `/me`, researcher 403 on role change, self-demotion 400, invalid role 422, unknown user 404. `tests/test_rate_limiting.py` (+4): setup-demo on the campaign bucket, XFF spoofing ignored without a trusted proxy, XFF honored for a trusted proxy, and CIDR allowlist matching.
+
+---
+
+## 18. Phase 11 — Finding evidence + frontend campaign views (2026-09-06)
+
+| Issue | Resolution |
+|---|---|
+| E-21 (frontend dead ends) | The campaign detail page now renders the real data instead of the generated report only: new `BudgetPanel`, `FindingsView`, `MutationTree`, `SeverityBadge` components wired into `frontend/src/app/campaigns/[id]/page.tsx`. |
+| E-21 (backend gaps) | Migration `b1a2c3d4e5f6` adds `vulnerabilities.evaluator_evidence` / `verifier_evidence` (quoted verdict evidence retained for the dashboard); the campaigns router exposes per-campaign findings/budget/mutation-tree data; the vulnerabilities router + evaluation/verification services persist evidence. |
+
+Commit `e22ca65 "phase 11 hogya"`. Test count at the next phase's baseline: the suite also gained evidence-column migration round-trip coverage.
+
+---
+
+## 19. Phase 12 — Analytics + reproducible benchmark framework (2026-09-06)
+
+| Issue | Resolution |
+|---|---|
+| E-22 (no benchmark framework) | New `benchmarks/` package (kept outside `app/` — it is a runtime import, not part of the pip module): `metrics.py` holds the single pure metric-math module (zero DB/network), `scenarios.py` defines guardrail probe scenarios, `runner.py` drives mock-provider campaign ablations, and `run_benchmark.py` is the CLI (`python -m benchmarks.run_benchmark --json` writes `benchmark-report.json`). |
+| E-22 (no metrics endpoint) | New `MetricsService` (`app/services/metrics.py`) aggregates persisted telemetry (attacks, verified findings by severity, token ledger) into the same `AggregatedMetrics` bundle the benchmark uses, so the API and the harness agree. `GET /api/v1/analytics/metrics` (user-scoped) and `GET /api/v1/analytics/experiments/{id}/metrics` (ownership-checked) sit behind `app/api/routers/analytics.py`. |
+| Tooling | `make benchmark` + CI benchmark gate; `.gitignore` covers generated reports. |
+
+Commit `c2fe7b4 "uhhhh"`. **152/152 tests pass** (baseline verified at the start of Phase 13). Lint + typecheck + benchmark gates green.
+
+---
+
+## 20. Phase 13 — Observability + onboarding completion (2026-09-06)
+
+**161/161 tests pass.** Lint + typecheck + benchmark gates green.
+
+| Issue | Resolution |
+|---|---|
+| E-20 (structured LLM-call records) | `LiteLLMTargetProvider` emits a structured `provider.llm_call` event (model, latency, prompt/completion/total tokens) on every successful completion — the four agents' calls are all covered. |
+| E-20 (campaign_id on provider errors) | `BudgetedTargetProvider` — the only layer that always knows the campaign + role — emits a campaign-scoped `provider.llm_error` event (campaign_id, role, model, error_message) when a wrapped delegate returns an error. `ExecutionService` logs (`execution.attack_executed` / `execution.provider_error`) now carry `campaign_id` (and `strategy`). |
+| E-20 (masking) | `MaskingFormatter` moved from 3 blunt substring replacements to a single-pass regex redactor covering `api_key`/`x-api-key`/`client_secret`/`access_token`/`refresh_token`/`authorization`/`password`/`private_key`/`secret`, `Bearer <token>`, raw `sk-...`, and JWT `eyJ...` headers — no value can re-trigger a sibling rule. The JSON context-field whitelist gained `role`, token counters, `error_message`, `transient`, and `path`. |
+| E-17 (observability hardening) | `alembic/env.py` now calls `fileConfig(..., disable_existing_loggers=False)`: in-process migrations were silently disabling every pre-existing application logger for the rest of the process (surfaced by the new logging tests). |
+| E-17 (onboarding remainder) | Root `README.md` (architecture, local + Docker quickstart, configuration table, Makefile reference, API surface, CI/testing, governance). `backend/Dockerfile` (one image, API default cmd + worker override, unprivileged `oracle` user) and `frontend/Dockerfile` (multi-stage Next.js 16 production build with build-arg `NEXT_PUBLIC_API_URL`) plus matching `.dockerignore` files. `docker-compose.yml` now runs the full stack: pgvector `db` + `redis` healthchecks, `backend` (:8000), `worker` (recovery-aware), `frontend` (:3000); `SECRET_KEY` is mandatory (fails loudly), LLM keys and admin emails pass through. Compose config validated via `docker compose config`. |
+
+New tests: `tests/test_observability.py` (9) — key-value/Bearer/JWT/`sk-` masking, single-pass redaction (no `=***=***` cascade), whitelist enforcement (unknown extras dropped), `provider.llm_call` event shape, wrapper `provider.llm_error` campaign context, and no double-logging on success.
+
+Still open (deliberate, non-blocking): Docker image builds could not be smoke-tested on this machine (Docker daemon unavailable; only `docker compose config` was verifiable).

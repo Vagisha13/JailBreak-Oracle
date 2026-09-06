@@ -20,6 +20,9 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 from app.targets.base import TargetProvider
+from app.core.logging import get_logger
+
+logger = get_logger("budget")
 
 # Per-1K-token USD pricing as (input, output). Keyed longest-first so substring
 # matches resolve to the most specific model (e.g. "openai/gpt-4o-mini" hits the
@@ -234,6 +237,23 @@ class BudgetedTargetProvider(TargetProvider):
             self.budget.check_allow(model, prompt)
 
         response = await self.delegate.execute(prompt, config)
+
+        # Campaign-scoped structured telemetry (E-20): the wrapping layer is the
+        # only one that always knows the campaign + role, so provider failures
+        # for attacker/evaluator/verifier calls carry the campaign_id that the
+        # low-level provider cannot know.
+        if response.error and self.experiment_id is not None:
+            logger.warning(
+                "LLM provider error (campaign)",
+                extra={
+                    "event_name": "provider.llm_error",
+                    "campaign_id": str(self.experiment_id),
+                    "role": self.role,
+                    "model": model,
+                    "provider": type(self.delegate).__name__,
+                    "error_message": response.error,
+                },
+            )
 
         if self.tracker is not None:
             entry = self.tracker.record_usage(

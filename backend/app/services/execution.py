@@ -121,6 +121,7 @@ class ExecutionService:
                 extra={
                     "event_name": "execution.provider_error",
                     "attack_id": str(attack_id),
+                    "campaign_id": str(experiment_id),
                     "provider": target_provider_type,
                 },
             )
@@ -130,7 +131,9 @@ class ExecutionService:
                 extra={
                     "event_name": "execution.attack_executed",
                     "attack_id": str(attack_id),
+                    "campaign_id": str(experiment_id),
                     "provider": target_provider_type,
+                    "strategy": attack.strategy_name,
                     "latency_ms": result.latency_ms,
                 },
             )

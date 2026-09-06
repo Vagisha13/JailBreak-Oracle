@@ -1,4 +1,9 @@
-version: '3.8'
+# Jailbreak Oracle — full local stack.
+#
+#   db (pgvector) + redis  ->  backend API  +  worker  +  frontend
+#
+# Secrets come from the repo-root `.env` file (see README "Docker quickstart").
+# `SECRET_KEY` is mandatory; set it before running compose-up.
 
 services:
   db:
@@ -12,6 +17,11 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oracle_user -d oracle_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     restart: unless-stopped
 
   redis:
@@ -19,6 +29,74 @@ services:
     container_name: oracle_redis
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    container_name: oracle_backend
+    environment: &backend_env
+      APP_ENV: production
+      LOG_LEVEL: INFO
+      ASYNC_DATABASE_URL: postgresql+asyncpg://oracle_user:oracle_password@db:5432/oracle_db
+      SYNC_DATABASE_URL: postgresql+psycopg2://oracle_user:oracle_password@db:5432/oracle_db
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set (see README "Docker quickstart")}
+      BOOTSTRAP_ADMIN_EMAILS: ${BOOTSTRAP_ADMIN_EMAILS:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      ATTACKER_PROVIDER: ${ATTACKER_PROVIDER:-litellm}
+      ATTACKER_MODEL: ${ATTACKER_MODEL:-gpt-4o-mini}
+      EVALUATOR_PROVIDER: ${EVALUATOR_PROVIDER:-litellm}
+      EVALUATOR_MODEL: ${EVALUATOR_MODEL:-gpt-4o-mini}
+      VERIFIER_PROVIDER: ${VERIFIER_PROVIDER:-litellm}
+      VERIFIER_MODEL: ${VERIFIER_MODEL:-gpt-4o-mini}
+      DEFAULT_TARGET_PROVIDER: ${DEFAULT_TARGET_PROVIDER:-litellm}
+      DEFAULT_TARGET_MODEL: ${DEFAULT_TARGET_MODEL:-gpt-4o-mini}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      MAX_CAMPAIGN_COST: ${MAX_CAMPAIGN_COST:-50.0}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: ./backend
+    container_name: oracle_worker
+    command: ["python", "-m", "app.worker"]
+    environment: *backend_env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
+    container_name: oracle_frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
     restart: unless-stopped
 
 volumes:
