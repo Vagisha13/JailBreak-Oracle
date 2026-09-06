@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 480  # 8 hours
 
+    # Comma-separated emails promoted to the "admin" role on registration (E-16).
+    # Unset/empty means every new user is a "researcher".
+    BOOTSTRAP_ADMIN_EMAILS: str = ""
+
     # ── LLM Provider Keys ─────────────────────────────────────
     OPENAI_API_KEY: Optional[str] = None
     ANTHROPIC_API_KEY: Optional[str] = None
@@ -71,6 +75,10 @@ class Settings(BaseSettings):
     CAMPAIGN_RATE_LIMIT_PER_MINUTE: int = 5  # campaign creation / start
     LLM_RATE_LIMIT_PER_MINUTE: int = 30  # LLM-backed endpoints (verify)
     RATE_LIMIT_WINDOW_SECONDS: int = 60
+    # Comma-separated reverse-proxy IPs/CIDRs allowed to set ``X-Forwarded-For``
+    # for rate limiting (E-24). Empty disables XFF trust entirely, so clients
+    # cannot spoof their way around per-IP buckets via the header.
+    TRUSTED_PROXIES: str = ""
 
     # ── Redis (job queue + distributed rate limiting) ─────────
     REDIS_URL: Optional[str] = None
@@ -97,6 +105,14 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+
+    @property
+    def bootstrap_admin_email_list(self) -> list[str]:
+        return [e.strip().lower() for e in self.BOOTSTRAP_ADMIN_EMAILS.split(",") if e.strip()]
+
+    @property
+    def trusted_proxy_list(self) -> list[str]:
+        return [p.strip() for p in self.TRUSTED_PROXIES.split(",") if p.strip()]
 
     @property
     def jwt_secret(self) -> str:

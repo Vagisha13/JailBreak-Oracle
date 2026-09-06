@@ -10,7 +10,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.future import select
 
 from app.core.config import settings
-from app.core.errors import AuthenticationError
+from app.core.errors import AuthenticationError, AuthorizationError
 from app.core.logging import get_logger
 from app.db.session import AsyncSessionLocal
 from app.models.domain import User
@@ -67,12 +67,25 @@ async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)) -> Use
     return user
 
 
-async def get_current_user_optional(
-    token: Optional[str] = Depends(oauth2_scheme),
-) -> Optional[User]:
-    if token is None:
-        return None
-    try:
-        return await get_current_user(token)
-    except AuthenticationError:
-        return None
+def require_roles(*roles: str):
+    """Dependency factory: resolve the caller and require one of the given roles.
+
+    Usage: ``user: User = Depends(require_roles("admin"))``. Non-matching but
+    authenticated users get a 403; unauthenticated callers still get a 401.
+    """
+
+    async def _require(current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role not in roles:
+            logger.warning(
+                "Role check denied",
+                extra={
+                    "event_name": "authx.role_denied",
+                    "user_id": str(current_user.id),
+                    "role": current_user.role,
+                    "required_roles": list(roles),
+                },
+            )
+            raise AuthorizationError("Insufficient permissions.")
+        return current_user
+
+    return _require

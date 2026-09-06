@@ -290,3 +290,16 @@ New tests: `tests/test_budget.py` (12) — cost-table resolution (specific, subs
 | E-25 (thin worker test coverage) | Added heartbeat-focused recovery tests: fresh-heartbeat RUNNING survives recovery, stale-heartbeat RUNNING is resumed, legacy-NULL-heartbeat falls back to `created_at` (old swept / fresh kept), and heartbeat is observed non-NULL mid-run and after completion. Stack now 115 tests. |
 
 New tests in `tests/test_campaign_lifecycle.py` (4, E-25): `test_running_with_fresh_heartbeat_not_swept`, `test_running_with_stale_heartbeat_resumed`, `test_legacy_running_without_heartbeat_uses_created_at`, `test_heartbeat_bumped_during_and_after_campaign`.
+
+## 17. Phase 10 — Role-based authorization + trusted-proxy rate limiting (2026-09-06)
+
+**129/129 tests pass.** Lint + typecheck gates green.
+
+| Issue | Resolution |
+|---|---|
+| E-24 (XFF spoof bypass) | The rate limiter trusted `X-Forwarded-For` unconditionally, so any client could rotate the header to mint fresh per-IP buckets and bypass limits. New `settings.TRUSTED_PROXIES` (comma-separated IPs/CIDRs, default empty) gates XFF trust: a forwarded header is honored only when the direct socket peer is a configured proxy (`_is_trusted_proxy` via `ipaddress`, malformed entries skipped); otherwise the real peer is used. |
+| E-16 (dead auth helpers) | Removed unused `auth.get_current_user_optional` and `access.experiment_belongs_to_user`. |
+| E-23 (setup-demo) | Confirmed/locked-in: `POST /campaigns/setup-demo` already shares the campaign rate-limit bucket; dedicated test added. |
+| New: RBAC | `User.role` is now meaningful. `require_roles(*roles)` dependency factory (401 unauthenticated / 403 wrong role, structured `authx.role_denied` event) backs a new admin-only surface: `GET /api/v1/auth/users` (directory) and `PATCH /api/v1/auth/users/{id}/role` (role assignment; self-demotion returns 400 so the last admin cannot lock everyone out). Registration promotes emails listed in `settings.BOOTSTRAP_ADMIN_EMAILS` (whitespace/case-insensitive) to `admin`; everyone else is `researcher`. |
+
+New tests: `tests/test_authz_admin.py` (10) — bootstrap promotion (case/whitespace), default researcher, admin directory, 401 / 403 guards, promote-success reflected via `/me`, researcher 403 on role change, self-demotion 400, invalid role 422, unknown user 404. `tests/test_rate_limiting.py` (+4): setup-demo on the campaign bucket, XFF spoofing ignored without a trusted proxy, XFF honored for a trusted proxy, and CIDR allowlist matching.

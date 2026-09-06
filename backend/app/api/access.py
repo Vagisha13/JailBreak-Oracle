@@ -6,7 +6,6 @@ rejected by ``get_current_user`` (401); authenticated callers that do not own
 the resource receive a 403; missing resources receive a 404.
 """
 import uuid
-from typing import Optional
 
 from sqlalchemy.future import select
 
@@ -101,9 +100,3 @@ async def get_user_project_ids(user_id: uuid.UUID) -> list[uuid.UUID]:
     async with AsyncSessionLocal() as session:
         rows = await session.execute(select(Project.id).where(Project.owner_id == user_id))
         return [row[0] for row in rows.all()]
-
-
-async def experiment_belongs_to_user(
-    experiment_id: uuid.UUID, user_id: uuid.UUID
-) -> Optional[Experiment]:
-    return await get_experiment_or_403(experiment_id, user_id)

@@ -6,8 +6,13 @@ Supports two backends:
   * Redis fixed-window counter (used when ``REDIS_URL`` is configured) so that
     limits are shared across multiple application instances in production.
 
+Client identity trusts ``X-Forwarded-For`` ONLY for peers listed in
+``settings.TRUSTED_PROXIES`` (E-24). Without a configured proxy allowlist the
+raw socket peer is used and spoofed forwarded headers are ignored.
+
 Health checks and other cheap/no-risk endpoints are never rate-limited.
 """
+import ipaddress
 import json
 import time
 from typing import Optional, Tuple
@@ -116,13 +121,37 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return "default", settings.RATE_LIMIT_PER_MINUTE
 
     @staticmethod
+    def _is_trusted_proxy(peer: str, trusted: list[str]) -> bool:
+        """True when the direct peer is in the trusted proxy allowlist."""
+        if not peer or peer == "unknown":
+            return False
+        try:
+            peer_ip = ipaddress.ip_address(peer)
+        except ValueError:
+            return False
+        for entry in trusted:
+            try:
+                if "/" in entry:
+                    if peer_ip in ipaddress.ip_network(entry, strict=False):
+                        return True
+                elif ipaddress.ip_address(entry) == peer_ip:
+                    return True
+            except ValueError:
+                # Malformed allowlist entries are skipped, never fatal.
+                continue
+        return False
+
+    @staticmethod
     def _client_ip(request: Request) -> str:
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
-        if request.client:
-            return request.client.host
-        return "unknown"
+        peer = request.client.host if request.client else "unknown"
+        # Only honor a forwarded client IP when the connecting peer is a
+        # configured trusted proxy — otherwise any client could spoof the header
+        # to evade per-IP buckets (E-24).
+        if RateLimitMiddleware._is_trusted_proxy(peer, settings.trusted_proxy_list):
+            forwarded = request.headers.get("x-forwarded-for")
+            if forwarded:
+                return forwarded.split(",")[0].strip()
+        return peer
 
     async def dispatch(self, request: Request, call_next) -> Response:
         if not settings.RATE_LIMIT_ENABLED:
