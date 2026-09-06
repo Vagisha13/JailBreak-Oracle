@@ -92,6 +92,8 @@ class Experiment(Base, BaseMixin):
     heartbeat_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Per-campaign cost cap (USD). NULL means "use the global MAX_CAMPAIGN_COST".
+    max_cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     project: Mapped["Project"] = relationship("Project", back_populates="experiments")
     target: Mapped["Target"] = relationship("Target", back_populates="experiments")

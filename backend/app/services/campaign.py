@@ -88,6 +88,9 @@ class CampaignOrchestrator:
                 status="PENDING",
                 attack_budget=attack_budget,
                 exploration_ratio=exploration_ratio,
+                # Persist the effective per-campaign cost cap so the ledger and
+                # status surface report it; NULL falls back to the global.
+                max_cost_usd=settings.MAX_CAMPAIGN_COST,
             )
             session.add(experiment)
             await session.commit()

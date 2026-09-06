@@ -17,6 +17,7 @@ from app.models.domain import (
     Attack,
     AttackResult,
     AttackMutation,
+    TokenUsage,
 )
 from app.schemas.campaign import CampaignStartRequest, CampaignResponse
 from app.services.factory import build_campaign_orchestrator
@@ -143,6 +144,18 @@ async def get_campaign_status(
     experiment_id: uuid.UUID, current_user: User = Depends(get_current_user)
 ):
     experiment = await get_experiment_or_403(experiment_id, current_user.id)
+
+    # Token/cost helm (E-12): roll up the campaign's persisted LLM ledger.
+    async with AsyncSessionLocal() as session:
+        usage_stmt = (
+            select(
+                func.coalesce(func.sum(TokenUsage.prompt_tokens), 0),
+                func.coalesce(func.sum(TokenUsage.completion_tokens), 0),
+                func.coalesce(func.sum(TokenUsage.cost_usd), 0.0),
+            ).where(TokenUsage.experiment_id == experiment.id)
+        )
+        usage_row = (await session.execute(usage_stmt)).one()
+
     return {
         "experiment_id": str(experiment.id),
         "name": experiment.name,
@@ -150,6 +163,12 @@ async def get_campaign_status(
         "attack_budget": experiment.attack_budget,
         "created_at": experiment.created_at.isoformat() if experiment.created_at else None,
         "finished_at": experiment.finished_at.isoformat() if experiment.finished_at else None,
+        "budget": {
+            "prompt_tokens": usage_row[0],
+            "completion_tokens": usage_row[1],
+            "total_cost_usd": round(float(usage_row[2]), 4),
+            "max_cost_usd": experiment.max_cost_usd,
+        },
     }
 
 
