@@ -8,7 +8,12 @@ psycopg2-binary==2.9.9
 alembic==1.13.1
 pgvector==0.2.5
 greenlet==3.0.3
-litellm>=1.35.0
+# litellm floor: 1.53.9 is the first with the httpx<0.28 constraint AND the
+# InternalServerError exception used by app.targets.litellm.
+# litellm ceiling: 1.56.10+ (incl. 1.57.0 and later) lifts the httpx<0.28
+# constraint, which conflicts with the pinned fastapi==0.110.0 / httpx==0.27.0
+# stack (starlette TestClient is incompatible with httpx>=0.28).
+litellm>=1.53.9,<1.56.10
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
 bcrypt==4.0.1

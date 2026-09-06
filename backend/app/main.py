@@ -110,12 +110,13 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
     )
 
 
-from app.api.routers import campaigns, reports, vulnerabilities, auth  # noqa: E402
+from app.api.routers import campaigns, reports, vulnerabilities, auth, analytics  # noqa: E402
 
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(campaigns.router, prefix="/api/v1")
 app.include_router(reports.router)
 app.include_router(vulnerabilities.router)
+app.include_router(analytics.router)
 
 
 @app.get("/health")

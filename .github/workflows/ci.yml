@@ -21,14 +21,16 @@ jobs:
           cache-dependency-path: backend/requirements.txt
       - run: pip install -r requirements.txt
       - name: Lint (flake8)
-        run: flake8 app tests --config=.flake8
+        run: flake8 app tests benchmarks --config=.flake8
       - name: Typecheck (mypy)
-        run: mypy --config-file=mypy.ini app
+        run: mypy --config-file=mypy.ini app benchmarks
       - name: Test (pytest)
         run: |
           # Tests run against an isolated temp SQLite DB by default.
           # Set TEST_DATABASE_URL here to use a dedicated PostgreSQL test instance.
           pytest
+      - name: Benchmark (reproducibility gate)
+        run: python -m benchmarks.run_benchmark --json
 
   frontend:
     name: Frontend lint & build
