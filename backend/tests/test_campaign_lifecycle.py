@@ -96,6 +96,23 @@ class StatusRecorder:
         self.task_done.set()
 
 
+class HeartbeatRecorder:
+    """Captures the experiment heartbeat_at value at attack time."""
+
+    def __init__(self, experiment_id: uuid.UUID):
+        self.experiment_id = experiment_id
+        self.heartbeats = []
+
+    async def record(self):
+        async with AsyncSessionLocal() as session:
+            exp = (
+                await session.execute(
+                    select(Experiment).where(Experiment.id == self.experiment_id)
+                )
+            ).scalars().first()
+            self.heartbeats.append(exp.heartbeat_at if exp else None)
+
+
 class FakeRedis:
     """Minimal stand-in for the async Redis client used by the queue.
 
@@ -276,6 +293,103 @@ async def test_stale_running_and_pending_recovery():
 
     assert fresh_id not in result["resumed_running"]
     assert fresh_id not in result["failed_pending"]
+
+
+async def _set_status_and_heartbeat(
+    experiment_id, status: str, heartbeat_at: datetime | None = None
+) -> None:
+    async with AsyncSessionLocal() as session:
+        exp = (
+            await session.execute(select(Experiment).where(Experiment.id == experiment_id))
+        ).scalars().first()
+        exp.status = status
+        exp.heartbeat_at = heartbeat_at
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_running_with_fresh_heartbeat_not_swept():
+    # Campaign created 2 days ago but ACTIVELY running (heartbeat bumped every
+    # round) must survive recovery even with a 1-hour timeout (E-25).
+    now = datetime.now(timezone.utc)
+    active_id = await _create_experiment(
+        name="Active Heartbeat", created_at=now - timedelta(days=2)
+    )
+    await _set_status_and_heartbeat(active_id, "RUNNING", heartbeat_at=now)
+
+    result = await recover_stale_campaigns(max_age_seconds=3600, now=now)
+
+    assert active_id not in result["resumed_running"]
+    async with AsyncSessionLocal() as session:
+        exp = (
+            await session.execute(select(Experiment).where(Experiment.id == active_id))
+        ).scalars().first()
+        assert exp.status == "RUNNING"
+
+
+@pytest.mark.asyncio
+async def test_running_with_stale_heartbeat_resumed():
+    # Heartbeat older than the timeout means the worker died mid-run.
+    now = datetime.now(timezone.utc)
+    abandoned_id = await _create_experiment(
+        name="Abandoned", created_at=now - timedelta(hours=5)
+    )
+    await _set_status_and_heartbeat(
+        abandoned_id,
+        "RUNNING",
+        heartbeat_at=now - timedelta(seconds=3600 * 3),
+    )
+
+    result = await recover_stale_campaigns(max_age_seconds=3600, now=now)
+
+    assert abandoned_id in result["resumed_running"]
+    async with AsyncSessionLocal() as session:
+        exp = (
+            await session.execute(select(Experiment).where(Experiment.id == abandoned_id))
+        ).scalars().first()
+        assert exp.status == "PENDING"
+        assert exp.finished_at is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_running_without_heartbeat_uses_created_at():
+    # Rows created before the heartbeat column existed have NULL heartbeat_at:
+    # staleness falls back to created_at so legacy behaviour is preserved.
+    now = datetime.now(timezone.utc)
+    old_run_id = await _create_experiment(
+        name="Legacy Old", created_at=now - timedelta(hours=5)
+    )
+    fresh_run_id = await _create_experiment(
+        name="Legacy Fresh", created_at=now - timedelta(minutes=30)
+    )
+    await _set_status_and_heartbeat(old_run_id, "RUNNING")
+    await _set_status_and_heartbeat(fresh_run_id, "RUNNING")
+
+    result = await recover_stale_campaigns(max_age_seconds=3600, now=now)
+
+    assert old_run_id in result["resumed_running"]
+    assert fresh_run_id not in result["resumed_running"]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_bumped_during_and_after_campaign():
+    experiment_id = await _create_experiment(attack_budget=2)
+    recorder = HeartbeatRecorder(experiment_id)
+    orchestrator = _build_orchestrator(MockAttackerProvider(recorder), experiment_id)
+
+    status = await process_campaign_job(experiment_id, orchestrator)
+
+    assert status == "COMPLETED"
+    assert recorder.heartbeats, "heartbeat not observed at attack time"
+    for heartbeat in recorder.heartbeats:
+        assert heartbeat is not None, "campaign had no liveness heartbeat mid-run"
+
+    async with AsyncSessionLocal() as session:
+        exp = (
+            await session.execute(select(Experiment).where(Experiment.id == experiment_id))
+        ).scalars().first()
+        assert exp.heartbeat_at is not None
+        assert exp.heartbeat_at >= exp.created_at
 
 
 @pytest.mark.asyncio

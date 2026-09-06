@@ -279,3 +279,14 @@ New tests: `tests/test_defender.py` (12) — LLM JSON parsing, fallback on no-pr
 | E-12 (no persistence / resume) | Migration `e5f1d2c4a7b9_token_usage` adds the `token_usage` ledger (role, model, tokens, cost_usd, FK→experiments) — round-trip + schema parity verified on fresh SQLite. Each call persists best-effort (`_persist_usage_entry`, failures never abort a call); `_load_campaign_spend` seeds a resumed campaign's tracker so the budget survives worker restarts instead of restarting at zero. Target `AttackResult.token_usage_json` now also records `model`/`cost_usd`/`role`. |
 
 New tests: `tests/test_budget.py` (12) — cost-table resolution (specific, substring, ollama, unknown default), cost math, per-role tracking, seeded resume spend, pre-call tripwire, remaining-budget floor, wrapper recording+persistence, wrapper block-before-delegate on exceeded budget, config-model override, campaign ledger persistence + reported cost, resume-not-double-counting, and FAILED-on-budget-exceeded lifecycle.
+
+## 16. Phase 9 — Worker hardening: liveness heartbeat + recovery semantics (2026-09-06)
+
+**115/115 tests pass.** Lint + typecheck gates green. Migration round-trip verified on fresh SQLite.
+
+| Issue | Resolution |
+|---|---|
+| E-25 (staleness keyed on `created_at`) | Recovery swept any RUNNING campaign older than the timeout — a campaign legitimately running for hours was killed mid-flight. New `experiments.heartbeat_at` (migration `f6a2e3d5b8c0`) is a worker liveness heartbeat bumped by the orchestrator on every status write and every round, and by `process_campaign_job` up-front on dequeue. `_resume_stale_running` now judges staleness on the heartbeat; legacy NULL-heartbeat rows fall back to `created_at`. |
+| E-25 (thin worker test coverage) | Added heartbeat-focused recovery tests: fresh-heartbeat RUNNING survives recovery, stale-heartbeat RUNNING is resumed, legacy-NULL-heartbeat falls back to `created_at` (old swept / fresh kept), and heartbeat is observed non-NULL mid-run and after completion. Stack now 115 tests. |
+
+New tests in `tests/test_campaign_lifecycle.py` (4, E-25): `test_running_with_fresh_heartbeat_not_swept`, `test_running_with_stale_heartbeat_resumed`, `test_legacy_running_without_heartbeat_uses_created_at`, `test_heartbeat_bumped_during_and_after_campaign`.

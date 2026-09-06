@@ -58,6 +58,9 @@ async def process_campaign_job(experiment_id: uuid.UUID, orchestrator=None) -> s
             "campaign_id": str(experiment_id),
         },
     )
+    # Touch the liveness heartbeat up-front so a long job is never mistaken for
+    # stale between dequeue and the orchestrator's first status write.
+    await _touch_heartbeat(experiment_id)
     try:
         await orchestrator.run_attack_loop(experiment_id)
     except Exception as exc:
@@ -85,6 +88,17 @@ async def process_campaign_job(experiment_id: uuid.UUID, orchestrator=None) -> s
     return status or "FAILED"
 
 
+async def _touch_heartbeat(experiment_id: uuid.UUID) -> None:
+    """Record worker liveness on the experiment, if it still exists."""
+    async with AsyncSessionLocal() as session:
+        experiment = (
+            await session.execute(select(Experiment).where(Experiment.id == experiment_id))
+        ).scalars().first()
+        if experiment is not None:
+            experiment.heartbeat_at = datetime.now(timezone.utc)
+            await session.commit()
+
+
 async def _mark_failed(experiment_id: uuid.UUID) -> None:
     async with AsyncSessionLocal() as session:
         experiment = (
@@ -108,18 +122,25 @@ async def _resume_stale_running(
     max_age_seconds: int, now: datetime
 ) -> list[uuid.UUID]:
     """Revert RUNNING campaigns stuck past the timeout to PENDING so the worker
-    re-runs them and the orchestrator resumes from its DB round state."""
+    re-runs them and the orchestrator resumes from its DB round state.
+
+    Staleness is judged on the worker liveness heartbeat (E-25): a campaign that
+    has legitimately been running for hours bumps its heartbeat each round and is
+    NEVER swept. Legacy rows without a heartbeat fall back to ``created_at``.
+    """
     cutoff = now - timedelta(seconds=max_age_seconds)
     resumed: list[uuid.UUID] = []
     async with AsyncSessionLocal() as session:
-        stale = (
+        running = (
             await session.execute(
-                select(Experiment).where(
-                    Experiment.status == "RUNNING",
-                    Experiment.created_at < cutoff,
-                )
+                select(Experiment).where(Experiment.status == "RUNNING")
             )
         ).scalars().all()
+        stale = [
+            experiment
+            for experiment in running
+            if _aware(experiment.heartbeat_at or experiment.created_at) < cutoff
+        ]
         for experiment in stale:
             experiment.status = "PENDING"
             experiment.finished_at = None
@@ -134,7 +155,8 @@ async def recover_stale_campaigns(
 ) -> dict:
     """
     Recovery routine run on worker startup:
-      1. RUNNING campaigns older than the campaign timeout -> PENDING (resumed,
+      1. RUNNING campaigns whose liveness heartbeat (or, for legacy rows,
+         ``created_at``) is older than the campaign timeout -> PENDING (resumed,
          the orchestrator continues from persisted round state on re-run).
       2. PENDING campaigns past the re-enqueue grace period -> re-queued.
       3. PENDING campaigns older than the campaign timeout -> FAILED.

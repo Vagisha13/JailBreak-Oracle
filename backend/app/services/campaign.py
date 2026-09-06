@@ -231,6 +231,10 @@ class CampaignOrchestrator:
             for round_num in range(starting_round, config.max_rounds + 1):
                 rounds_executed = round_num
 
+                # Liveness heartbeat (E-25): a slow long-running campaign bumps
+                # its heartbeat every round so recovery never sweeps it.
+                await self._bump_heartbeat(config.experiment_id)
+
                 # PLAN: explore new strategies vs. exploit the best-scoring one.
                 strategy = self._select_strategy(
                     config, available_strategies, strategies_used, strategy_scores
@@ -667,6 +671,18 @@ class CampaignOrchestrator:
             experiment = (await session.execute(stmt)).scalars().first()
             if experiment:
                 experiment.status = status
+                # Liveness heartbeat (E-25): bumped on every status write so the
+                # worker recovery pass keys staleness on activity, not age.
+                experiment.heartbeat_at = datetime.now(timezone.utc)
                 if status in ("COMPLETED", "FAILED"):
                     experiment.finished_at = datetime.now(timezone.utc)
+                await session.commit()
+
+    async def _bump_heartbeat(self, experiment_id: uuid.UUID) -> None:
+        """Worker liveness heartbeat: record that the campaign is actively running."""
+        async with AsyncSessionLocal() as session:
+            stmt = select(Experiment).where(Experiment.id == experiment_id)
+            experiment = (await session.execute(stmt)).scalars().first()
+            if experiment:
+                experiment.heartbeat_at = datetime.now(timezone.utc)
                 await session.commit()

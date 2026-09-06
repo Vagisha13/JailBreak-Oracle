@@ -86,6 +86,12 @@ class Experiment(Base, BaseMixin):
     finished_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Worker liveness heartbeat (E-25): bumped while the campaign ACTUALLY runs.
+    # Recovery uses this (not created_at) to decide staleness, so legitimately
+    # long campaigns are never misjudged as abandoned.
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     project: Mapped["Project"] = relationship("Project", back_populates="experiments")
     target: Mapped["Target"] = relationship("Target", back_populates="experiments")
