@@ -209,7 +209,13 @@ export default function NewCampaignPage() {
                 max="500"
                 required
                 value={formData.attack_budget}
-                onChange={(e) => setFormData({ ...formData, attack_budget: parseInt(e.target.value) })}
+                onChange={(e) => {
+                  const budget = parseInt(e.target.value, 10);
+                  setFormData({
+                    ...formData,
+                    attack_budget: Number.isNaN(budget) ? 1 : budget,
+                  });
+                }}
                 className="input-dark"
               />
               <p className="text-[10px] text-slate-500 mt-1">Maximum number of attack attempts (1-500).</p>
@@ -225,7 +231,13 @@ export default function NewCampaignPage() {
                 max="1"
                 required
                 value={formData.exploration_ratio}
-                onChange={(e) => setFormData({ ...formData, exploration_ratio: parseFloat(e.target.value) })}
+                onChange={(e) => {
+                  const ratio = parseFloat(e.target.value);
+                  setFormData({
+                    ...formData,
+                    exploration_ratio: Number.isNaN(ratio) ? 0.3 : ratio,
+                  });
+                }}
                 className="input-dark"
               />
               <p className="text-[10px] text-slate-500 mt-1">0.0 = exploit only, 1.0 = explore only.</p>

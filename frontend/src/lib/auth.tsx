@@ -56,18 +56,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   // Initialize authentication ONLY on the client.
   useEffect(() => {
-    const storedToken = localStorage.getItem("oracle_token");
+    const init = async () => {
+      const storedToken = localStorage.getItem("oracle_token");
 
-    if (!storedToken) {
-      setLoading(false);
-      return;
-    }
+      if (!storedToken) {
+        setLoading(false);
+        return;
+      }
 
-    setToken(storedToken);
+      setToken(storedToken);
 
-    void fetchUser(storedToken).finally(() => {
-      setLoading(false);
-    });
+      try {
+        await fetchUser(storedToken);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    void init();
   }, [fetchUser]);
 
   const login = useCallback(

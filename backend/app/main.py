@@ -30,6 +30,27 @@ async def _schema_exists() -> bool:
         )
 
 
+async def _schema_matches_models() -> bool:
+    """Return True when the database matches the current ORM models exactly.
+
+    ``create_all`` only creates missing tables; it never alters existing ones, so
+    a dev database that predates a model change silently drifts out of sync and
+    later explodes with opaque 500s (e.g. "no such column"). Fail fast instead.
+    """
+
+    async with engine.connect() as conn:
+        def _check(sync_conn) -> bool:
+            inspector = sa_inspect(sync_conn)
+            return all(
+                inspector.has_table(table.name)
+                and set(table.columns.keys())
+                <= {col["name"] for col in inspector.get_columns(table.name)}
+                for table in Base.metadata.sorted_tables
+            )
+
+        return await conn.run_sync(_check)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.validate_critical_secrets()
@@ -45,6 +66,12 @@ async def lifespan(app: FastAPI):
         # Development convenience only — the test suite uses its own isolated DB.
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+        if not await _schema_matches_models():
+            raise RuntimeError(
+                "Development database schema is out of date. Run "
+                "`alembic upgrade head` (backend/) or delete the stale "
+                "dev database file to regenerate it."
+            )
     yield
 
 
