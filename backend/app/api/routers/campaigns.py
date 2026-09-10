@@ -20,6 +20,7 @@ from app.models.domain import (
     AttackResult,
     AttackMutation,
     TokenUsage,
+    AgentRun,
 )
 from app.schemas.campaign import CampaignStartRequest, CampaignResponse
 from app.services.factory import build_campaign_orchestrator
@@ -230,6 +231,28 @@ async def get_campaign_status(
         else settings.MAX_CAMPAIGN_COST
     )
 
+    # Failure reason for FAILED campaigns, derived from the orchestrator's
+    # persisted <reason, error_type, error_message> telemetry (never synthesized).
+    failure_reason = None
+    if experiment.status == "FAILED":
+        failure_stmt = (
+            select(AgentRun.state_json)
+            .where(
+                AgentRun.experiment_id == experiment.id,
+                AgentRun.agent_type == "campaign",
+            )
+            .order_by(AgentRun.created_at.desc())
+        )
+        for (state,) in (await session.execute(failure_stmt)).all():
+            if isinstance(state, dict) and state.get("status") == "FAILED":
+                reason = state.get("reason")
+                if reason:
+                    error_type = state.get("error_type")
+                    message = state.get("error_message")
+                    detail = f" ({error_type}): {message}" if error_type else ""
+                    failure_reason = f"{reason}{detail}"
+                break
+
     per_role: dict[str, dict] = {}
     for role, calls, pt, ct, cost in per_role_rows:
         per_role[role] = {
@@ -273,6 +296,7 @@ async def get_campaign_status(
         "heartbeat_at": experiment.heartbeat_at.isoformat() if experiment.heartbeat_at else None,
         "is_stale": campaign_is_stale(experiment),
         "resumable": experiment.status in ("PENDING", "RUNNING"),
+        "failure_reason": failure_reason,
         "budget": budget,
     }
 

@@ -1,6 +1,13 @@
+import os
+from pathlib import Path
 from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Resolve `.env` relative to this file (backend/.env), never the process CWD:
+# uvicorn, the worker, tests, and REPL sessions must all load the SAME file no
+# matter where they are launched from.
+_ENV_FILE_PATH = Path(__file__).resolve().parents[2] / ".env"
 
 
 class Settings(BaseSettings):
@@ -100,7 +107,7 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE_PATH),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=True,
@@ -150,3 +157,25 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def export_provider_keys() -> None:
+    """Make configured provider keys visible to runtime SDKs (litellm, openai).
+
+    pydantic-settings loads ``.env`` only into the ``Settings`` object; the
+    SDKs resolve keys from the process environment or their own CWD-relative
+    dotenv loading. A missing key surfaces much later as a confusing, silent
+    ``Attacker provider failed`` campaign failure. Export the configured keys so
+    real provider calls work regardless of the process working directory.
+    Existing process env vars always win (they override ``.env``).
+    """
+    for env_name, value in (
+        ("OPENAI_API_KEY", settings.OPENAI_API_KEY),
+        ("ANTHROPIC_API_KEY", settings.ANTHROPIC_API_KEY),
+        ("DEEPSEEK_API_KEY", settings.DEEPSEEK_API_KEY),
+    ):
+        if value and not os.environ.get(env_name):
+            os.environ[env_name] = value
+
+
+export_provider_keys()

@@ -596,6 +596,21 @@ class CampaignOrchestrator:
 
         except Exception as exc:
             await self._update_experiment_status(config.experiment_id, "FAILED")
+            # Never swallow WHY a campaign died: persist a safe, queryable reason
+            # (error type + truncated message; provider messages are already
+            # secret-redacted by ``_normalize_error``).
+            await self._record_agent_run(
+                config.experiment_id,
+                "campaign",
+                {
+                    "rounds_completed": rounds_executed,
+                    "vulnerabilities_found": vulnerabilities_found,
+                    "status": "FAILED",
+                    "reason": "execution_error",
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc)[:1000],
+                },
+            )
             logger.error(
                 "Campaign failed",
                 extra={
@@ -603,6 +618,7 @@ class CampaignOrchestrator:
                     "campaign_id": str(config.experiment_id),
                     "status": "FAILED",
                     "error_type": type(exc).__name__,
+                    "reason": str(exc)[:300],
                 },
                 exc_info=True,
             )

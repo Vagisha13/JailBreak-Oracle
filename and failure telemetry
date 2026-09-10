@@ -1,0 +1,140 @@
+warning: in the working copy of 'backend/app/api/routers/campaigns.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/core/config.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/services/campaign.py', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/backend/app/api/routers/campaigns.py b/backend/app/api/routers/campaigns.py[m
+[1mindex 150ff5f..cf8bd2d 100644[m
+[1m--- a/backend/app/api/routers/campaigns.py[m
+[1m+++ b/backend/app/api/routers/campaigns.py[m
+[36m@@ -20,6 +20,7 @@[m [mfrom app.models.domain import ([m
+     AttackResult,[m
+     AttackMutation,[m
+     TokenUsage,[m
+[32m+[m[32m    AgentRun,[m
+ )[m
+ from app.schemas.campaign import CampaignStartRequest, CampaignResponse[m
+ from app.services.factory import build_campaign_orchestrator[m
+[36m@@ -230,6 +231,28 @@[m [masync def get_campaign_status([m
+         else settings.MAX_CAMPAIGN_COST[m
+     )[m
+ [m
+[32m+[m[32m    # Failure reason for FAILED campaigns, derived from the orchestrator's[m
+[32m+[m[32m    # persisted <reason, error_type, error_message> telemetry (never synthesized).[m
+[32m+[m[32m    failure_reason = None[m
+[32m+[m[32m    if experiment.status == "FAILED":[m
+[32m+[m[32m        failure_stmt = ([m
+[32m+[m[32m            select(AgentRun.state_json)[m
+[32m+[m[32m            .where([m
+[32m+[m[32m                AgentRun.experiment_id == experiment.id,[m
+[32m+[m[32m                AgentRun.agent_type == "campaign",[m
+[32m+[m[32m            )[m
+[32m+[m[32m            .order_by(AgentRun.created_at.desc())[m
+[32m+[m[32m        )[m
+[32m+[m[32m        for (state,) in (await session.execute(failure_stmt)).all():[m
+[32m+[m[32m            if isinstance(state, dict) and state.get("status") == "FAILED":[m
+[32m+[m[32m                reason = state.get("reason")[m
+[32m+[m[32m                if reason:[m
+[32m+[m[32m                    error_type = state.get("error_type")[m
+[32m+[m[32m                    message = state.get("error_message")[m
+[32m+[m[32m                    detail = f" ({error_type}): {message}" if error_type else ""[m
+[32m+[m[32m                    failure_reason = f"{reason}{detail}"[m
+[32m+[m[32m                break[m
+[32m+[m
+     per_role: dict[str, dict] = {}[m
+     for role, calls, pt, ct, cost in per_role_rows:[m
+         per_role[role] = {[m
+[36m@@ -273,6 +296,7 @@[m [masync def get_campaign_status([m
+         "heartbeat_at": experiment.heartbeat_at.isoformat() if experiment.heartbeat_at else None,[m
+         "is_stale": campaign_is_stale(experiment),[m
+         "resumable": experiment.status in ("PENDING", "RUNNING"),[m
+[32m+[m[32m        "failure_reason": failure_reason,[m
+         "budget": budget,[m
+     }[m
+ [m
+[1mdiff --git a/backend/app/core/config.py b/backend/app/core/config.py[m
+[1mindex bd356a3..23c3fb5 100644[m
+[1m--- a/backend/app/core/config.py[m
+[1m+++ b/backend/app/core/config.py[m
+[36m@@ -1,7 +1,14 @@[m
+[32m+[m[32mimport os[m
+[32m+[m[32mfrom pathlib import Path[m
+ from typing import Optional[m
+ [m
+ from pydantic_settings import BaseSettings, SettingsConfigDict[m
+ [m
+[32m+[m[32m# Resolve `.env` relative to this file (backend/.env), never the process CWD:[m
+[32m+[m[32m# uvicorn, the worker, tests, and REPL sessions must all load the SAME file no[m
+[32m+[m[32m# matter where they are launched from.[m
+[32m+[m[32m_ENV_FILE_PATH = Path(__file__).resolve().parents[2] / ".env"[m
+[32m+[m
+ [m
+ class Settings(BaseSettings):[m
+     PROJECT_NAME: str = "Jailbreak Oracle"[m
+[36m@@ -100,7 +107,7 @@[m [mclass Settings(BaseSettings):[m
+     LOG_LEVEL: str = "INFO"[m
+ [m
+     model_config = SettingsConfigDict([m
+[31m-        env_file=".env",[m
+[32m+[m[32m        env_file=str(_ENV_FILE_PATH),[m
+         env_file_encoding="utf-8",[m
+         extra="ignore",[m
+         case_sensitive=True,[m
+[36m@@ -150,3 +157,25 @@[m [mclass Settings(BaseSettings):[m
+ [m
+ [m
+ settings = Settings()[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef export_provider_keys() -> None:[m
+[32m+[m[32m    """Make configured provider keys visible to runtime SDKs (litellm, openai).[m
+[32m+[m
+[32m+[m[32m    pydantic-settings loads ``.env`` only into the ``Settings`` object; the[m
+[32m+[m[32m    SDKs resolve keys from the process environment or their own CWD-relative[m
+[32m+[m[32m    dotenv loading. A missing key surfaces much later as a confusing, silent[m
+[32m+[m[32m    ``Attacker provider failed`` campaign failure. Export the configured keys so[m
+[32m+[m[32m    real provider calls work regardless of the process working directory.[m
+[32m+[m[32m    Existing process env vars always win (they override ``.env``).[m
+[32m+[m[32m    """[m
+[32m+[m[32m    for env_name, value in ([m
+[32m+[m[32m        ("OPENAI_API_KEY", settings.OPENAI_API_KEY),[m
+[32m+[m[32m        ("ANTHROPIC_API_KEY", settings.ANTHROPIC_API_KEY),[m
+[32m+[m[32m        ("DEEPSEEK_API_KEY", settings.DEEPSEEK_API_KEY),[m
+[32m+[m[32m    ):[m
+[32m+[m[32m        if value and not os.environ.get(env_name):[m
+[32m+[m[32m            os.environ[env_name] = value[m
+[32m+[m
+[32m+[m
+[32m+[m[32mexport_provider_keys()[m
+[1mdiff --git a/backend/app/services/campaign.py b/backend/app/services/campaign.py[m
+[1mindex 415394f..fc99b37 100644[m
+[1m--- a/backend/app/services/campaign.py[m
+[1m+++ b/backend/app/services/campaign.py[m
+[36m@@ -596,6 +596,21 @@[m [mclass CampaignOrchestrator:[m
+ [m
+         except Exception as exc:[m
+             await self._update_experiment_status(config.experiment_id, "FAILED")[m
+[32m+[m[32m            # Never swallow WHY a campaign died: persist a safe, queryable reason[m
+[32m+[m[32m            # (error type + truncated message; provider messages are already[m
+[32m+[m[32m            # secret-redacted by ``_normalize_error``).[m
+[32m+[m[32m            await self._record_agent_run([m
+[32m+[m[32m                config.experiment_id,[m
+[32m+[m[32m                "campaign",[m
+[32m+[m[32m                {[m
+[32m+[m[32m                    "rounds_completed": rounds_executed,[m
+[32m+[m[32m                    "vulnerabilities_found": vulnerabilities_found,[m
+[32m+[m[32m                    "status": "FAILED",[m
+[32m+[m[32m                    "reason": "execution_error",[m
+[32m+[m[32m                    "error_type": type(exc).__name__,[m
+[32m+[m[32m                    "error_message": str(exc)[:1000],[m
+[32m+[m[32m                },[m
+[32m+[m[32m            )[m
+             logger.error([m
+                 "Campaign failed",[m
+                 extra={[m
+[36m@@ -603,6 +618,7 @@[m [mclass CampaignOrchestrator:[m
+                     "campaign_id": str(config.experiment_id),[m
+                     "status": "FAILED",[m
+                     "error_type": type(exc).__name__,[m
+[32m+[m[32m                    "reason": str(exc)[:300],[m
+                 },[m
+                 exc_info=True,[m
+             )[m
