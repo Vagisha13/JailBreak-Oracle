@@ -5,7 +5,7 @@ from sqlalchemy.future import select
 
 from app.db.session import AsyncSessionLocal
 from app.models.domain import Vulnerability, Attack, AttackResult
-from app.agents.verifier import VerificationDisposition, VerifierAgent
+from app.agents.verifier import VerificationDisposition, VerifierAgent, VerifierVerdict
 from app.schemas.verification import VerificationResult
 from app.core.logging import get_logger
 
@@ -82,3 +82,49 @@ class VerificationService:
                 verification_reasoning=verdict.reasoning,
                 remediation_guidance=verdict.remediation_guidance,
             )
+
+    async def verify_attack(self, attack_id: uuid.UUID) -> VerifierVerdict:
+        """Blindly verify an attack for mutation feedback.
+
+        Independence (E-09): the verifier ONLY sees the attack prompt and the
+        target's raw response — never the evaluator's verdict.  This is a
+        lightweight, non-persisting verification used solely to inform the
+        mutation engine; blocked attacks are not findings and do not touch the
+        ``vulnerabilities`` table.
+        """
+        async with AsyncSessionLocal() as session:
+            attack = (
+                await session.execute(
+                    select(Attack).where(Attack.id == attack_id)
+                )
+            ).scalars().first()
+            if not attack:
+                raise ValueError(f"Attack {attack_id} not found.")
+
+            result_stmt = (
+                select(AttackResult)
+                .where(AttackResult.attack_id == attack.id)
+            )
+            attack_result = (
+                await session.execute(result_stmt)
+            ).scalars().first()
+            target_response = (
+                attack_result.target_response if attack_result else ""
+            )
+
+        verdict = await self.verifier_agent.verify(
+            attack_prompt=attack.prompt_text,
+            target_response=target_response,
+        )
+
+        logger.info(
+            "Attack blind verification completed",
+            extra={
+                "event_name": "verification.attack_feedback",
+                "attack_id": str(attack_id),
+                "disposition": verdict.disposition.value,
+                "confidence": verdict.confidence,
+            },
+        )
+
+        return verdict

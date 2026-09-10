@@ -90,6 +90,20 @@ async def test_duplicate_email_registration_rejected(api_client, register_user):
 
 
 @pytest.mark.asyncio
+async def test_registration_disabled_when_flag_off(api_client, monkeypatch):
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "ALLOW_REGISTRATION", False)
+
+    resp = await api_client.post(
+        "/api/v1/auth/register",
+        json={"email": "newbie@example.com", "password": "supersecret123"},
+    )
+    assert resp.status_code == 403
+    assert "Self-registration is disabled" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_cross_user_campaign_ownership_enforced(
     api_client, demo_env, mock_llm_providers
 ):

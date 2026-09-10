@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import litellm
 
@@ -80,16 +80,26 @@ class LiteLLMTargetProvider(TargetProvider):
         self.max_retries = settings.LLM_MAX_RETRIES if max_retries is None else max_retries
         self.timeout = settings.LLM_TIMEOUT_SECONDS if timeout is None else timeout
 
-    async def execute(self, prompt: str, config: Dict[str, Any]) -> TargetResponse:
+    async def execute(
+        self,
+        prompt: str,
+        config: Dict[str, Any],
+        *,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> TargetResponse:
         start_time = time.perf_counter()
 
         model = config.get("model", self.default_model)
         temperature = config.get("temperature", 0.7)
         api_key = config.get("api_key")
 
+        # Multi-turn conversations pass the full OpenAI-style message list; a
+        # single-turn call falls back to the original ``[{user: prompt}]`` shape.
+        request_messages = messages if messages else [{"role": "user", "content": prompt}]
+
         kwargs: Dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": request_messages,
             "temperature": temperature,
             "timeout": self.timeout,
         }

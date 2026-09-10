@@ -20,8 +20,17 @@ from benchmarks.runner import run_benchmark
 
 
 def _print_table(report) -> None:
-    widths = [14, 40, 8, 8, 8, 12]
-    headers = ["config", "description", "attacks", "vulns", "verified", "success%"]
+    widths = [16, 34, 8, 8, 8, 9, 9, 9]
+    headers = [
+        "config",
+        "description",
+        "attacks",
+        "vulns",
+        "verified",
+        "success%",
+        "mutation%",
+        "roundsToOK",
+    ]
     print(" | ".join(h.ljust(w) for h, w in zip(headers, widths)))
     print("-+-".join("-" * w for w in widths))
     for result in report.ablations:
@@ -30,11 +39,13 @@ def _print_table(report) -> None:
             " | ".join(
                 [
                     result.config_name.ljust(widths[0]),
-                    (result.description[:39]).ljust(widths[1]),
+                    (result.description[:33]).ljust(widths[1]),
                     str(m.total_attacks).ljust(widths[2]),
                     str(m.total_vulnerabilities).ljust(widths[3]),
                     str(m.verified_vulnerabilities).ljust(widths[4]),
                     f"{m.jailbreak_success_rate:.1f}".ljust(widths[5]),
+                    f"{m.mutation_success_rate:.1f}".ljust(widths[6]),
+                    f"{m.avg_rounds_to_success:.1f}".ljust(widths[7]),
                 ]
             )
         )
@@ -43,7 +54,17 @@ def _print_table(report) -> None:
 def _write_csv(report, target: Path) -> None:
     with target.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["config", "attacks", "vulns", "verified", "success_rate"])
+        writer.writerow(
+            [
+                "config",
+                "attacks",
+                "vulns",
+                "verified",
+                "success_rate",
+                "mutation_success_rate",
+                "avg_rounds_to_success",
+            ]
+        )
         for result in report.ablations:
             m = result.metrics
             writer.writerow(
@@ -53,6 +74,8 @@ def _write_csv(report, target: Path) -> None:
                     m.total_vulnerabilities,
                     m.verified_vulnerabilities,
                     m.jailbreak_success_rate,
+                    m.mutation_success_rate,
+                    m.avg_rounds_to_success,
                 ]
             )
 

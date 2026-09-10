@@ -9,7 +9,7 @@ the dashboard. Nothing here touches the database or the network.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 # Severity ranking used for "most severe finding" style computations.
 SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
@@ -37,6 +37,9 @@ class AggregateInputs:
     strategy_stats: Dict[str, StrategyStats] = field(default_factory=dict)
     total_tokens: int = 0
     total_cost_usd: float = 0.0
+    mutations_attempted: int = 0
+    mutations_successful: int = 0
+    success_rounds: List[int] = field(default_factory=list)
 
 
 def aggregate_inputs() -> AggregateInputs:
@@ -61,6 +64,7 @@ def add_attack(
     success: bool,
     tokens: int = 0,
     cost_usd: float = 0.0,
+    round_number: int = 0,
 ) -> None:
     """Accumulate a single attack (optionally token/cost usage)."""
     inputs.total_attacks += 1
@@ -68,8 +72,21 @@ def add_attack(
     stat.total += 1
     if success:
         stat.successful += 1
+        if round_number > 0:
+            inputs.success_rounds.append(round_number)
     stat.tokens += tokens
     stat.cost_usd += cost_usd
+    inputs.total_tokens += tokens
+    inputs.total_cost_usd += cost_usd
+
+
+def add_mutation_attempt(
+    inputs: AggregateInputs, success: bool, tokens: int = 0, cost_usd: float = 0.0
+) -> None:
+    """Accumulate a mutation round (a retry fired on a blocked attack)."""
+    inputs.mutations_attempted += 1
+    if success:
+        inputs.mutations_successful += 1
     inputs.total_tokens += tokens
     inputs.total_cost_usd += cost_usd
 
@@ -87,7 +104,11 @@ class AggregatedMetrics:
     strategy_breakdown: dict = field(default_factory=dict)
     jailbreak_success_rate: float = 0.0
     verification_rate: float = 0.0
+    mutation_success_rate: float = 0.0
+    avg_rounds_to_success: float = 0.0
     false_positive_rate: float = 0.0
+    mutations_attempted: int = 0
+    mutations_successful: int = 0
     total_tokens: int = 0
     total_cost_usd: float = 0.0
     avg_attacks_per_experiment: float = 0.0
@@ -110,6 +131,10 @@ class AggregatedMetrics:
             },
             "jailbreak_success_rate": round(self.jailbreak_success_rate, 2),
             "verification_rate": round(self.verification_rate, 2),
+            "mutation_success_rate": round(self.mutation_success_rate, 2),
+            "avg_rounds_to_success": round(self.avg_rounds_to_success, 2),
+            "mutations_attempted": self.mutations_attempted,
+            "mutations_successful": self.mutations_successful,
             "false_positive_rate": round(self.false_positive_rate, 2),
             "total_tokens": self.total_tokens,
             "total_cost_usd": round(self.total_cost_usd, 4),
@@ -134,6 +159,16 @@ def compute_metrics(inputs: AggregateInputs, num_experiments: int = 0) -> Aggreg
 
     verified = inputs.verified_count
     verification_rate = verified * 100.0 / total_vulns if total_vulns else 0.0
+    mutation_success_rate = (
+        inputs.mutations_successful * 100.0 / inputs.mutations_attempted
+        if inputs.mutations_attempted
+        else 0.0
+    )
+    avg_rounds_to_success = (
+        sum(inputs.success_rounds) / len(inputs.success_rounds)
+        if inputs.success_rounds
+        else 0.0
+    )
     false_positive_rate = 0.0
 
     metrics = AggregatedMetrics(
@@ -146,6 +181,10 @@ def compute_metrics(inputs: AggregateInputs, num_experiments: int = 0) -> Aggreg
         strategy_breakdown=dict(inputs.strategy_stats),
         jailbreak_success_rate=jailbreak_rate,
         verification_rate=verification_rate,
+        mutation_success_rate=mutation_success_rate,
+        avg_rounds_to_success=avg_rounds_to_success,
+        mutations_attempted=inputs.mutations_attempted,
+        mutations_successful=inputs.mutations_successful,
         false_positive_rate=false_positive_rate,
         total_tokens=inputs.total_tokens,
         total_cost_usd=inputs.total_cost_usd,

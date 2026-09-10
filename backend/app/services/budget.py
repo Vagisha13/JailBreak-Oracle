@@ -231,12 +231,31 @@ class BudgetedTargetProvider(TargetProvider):
         self.experiment_id = experiment_id
         self.persist_cb = persist_cb
 
-    async def execute(self, prompt: str, config: dict):
+    async def execute(
+        self,
+        prompt: str,
+        config: dict,
+        *,
+        messages: Optional[List[dict]] = None,
+    ):
         model = (config or {}).get("model") or self.default_model
         if self.budget is not None:
-            self.budget.check_allow(model, prompt)
+            # Multi-turn calls charge the whole conversation, not just the
+            # latest turn: estimate the projected prompt from all message
+            # contents so the tripwire fires before the conversation crosses cap.
+            estimate_prompt = prompt
+            if messages:
+                estimate_prompt = "\n".join(
+                    (m.get("content") or "") for m in messages if isinstance(m, dict)
+                )
+            self.budget.check_allow(model, estimate_prompt)
 
-        response = await self.delegate.execute(prompt, config)
+        if messages is not None:
+            response = await self.delegate.execute(prompt, config, messages=messages)
+        else:
+            # Backward-compatible path for wrapped providers that do not yet
+            # accept the keyword-only ``messages`` argument.
+            response = await self.delegate.execute(prompt, config)
 
         # Campaign-scoped structured telemetry (E-20): the wrapping layer is the
         # only one that always knows the campaign + role, so provider failures

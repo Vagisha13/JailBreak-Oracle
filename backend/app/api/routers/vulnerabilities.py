@@ -1,4 +1,3 @@
-import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -6,6 +5,7 @@ from sqlalchemy.future import select
 
 from app.core.auth import get_current_user
 from app.core.config import settings
+from app.core.logging import get_logger
 from app.db.session import AsyncSessionLocal
 from app.models.domain import User, Attack, AttackResult
 from app.schemas.verification import VerificationRequest, VerificationResult
@@ -14,7 +14,7 @@ from app.agents.verifier import VerifierAgent
 from app.targets.factory import TargetFactory
 from app.api.access import get_vulnerability_or_403
 
-logger = logging.getLogger(__name__)
+logger = get_logger("api.vulnerabilities")
 
 router = APIRouter(prefix="/api/v1/vulnerabilities", tags=["Vulnerabilities"])
 

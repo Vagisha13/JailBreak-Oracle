@@ -7,8 +7,10 @@ registration order, so the outcome is fully reproducible:
 
 * Rounds 1-5 (static strategies)  -> base payload blocked
 * Round 6 (``multi_turn``)        -> base payload blocked, then the mutation
-  loop evolves it; the evolved payload carries the ``%ORACLE_EVOLVED%`` marker
-  the mock target complies with
+  loop escalates the CONVERSATION turn-by-turn; the 2nd turn is still blocked,
+  and only the 3rd turn (which carries the ``%ORACLE_EVOLVED%`` marker the mock
+  target complies with when it appears anywhere in the message history)
+  jailbreaks
 * Evaluator grades JAILBREAK, vulnerability persisted
 * Independent verifier CONFIRMS, verified_status -> CONFIRMED_VULNERABILITY
 
@@ -122,12 +124,12 @@ async def test_end_to_end_mock_campaign_block_mutate_jailbreak_verify(
             .scalars()
             .all()
         )
-        # 5 static-round attacks + base + mutated in round 6 => 7 rows.
-        assert len(attacks) == 7
+# 5 static-round attacks + root + 2nd turn + 3rd turn in round 6 => 8 rows.
+        assert len(attacks) == 8
 
         # The payload that actually jailbroke carries the evolution marker, i.e.
         # it was produced by the ATTACKER's mutation path, not handed above the
-        # service layer. Its parent is the round-6 base attack (lineage).
+        # service layer. Its parent is the round-6 2nd-turn attack (lineage).
         jailbroken = [
             a for a in attacks if EVOLVED_MARKER in a.prompt_text
         ]
@@ -140,14 +142,26 @@ async def test_end_to_end_mock_campaign_block_mutate_jailbreak_verify(
         assert parent is not None and parent.strategy_name == evolved.strategy_name
         assert parent.round_number == evolved.round_number
 
-        # Blocked base payloads: exactly one mutation (don't burn the budget
-        # re-rolling identical evolved prompts against the deterministic target).
+        # The jailbreak requires a real 3-turn impression: root -> 2nd attempt
+        # (blocked) -> evolved turn. The evolved turn's grandparent must be a
+        # non-evolved intermediate turn in the same round (the "second payload").
+        assert parent.parent_attack_id is not None
+        grandparent = (
+            await session.execute(
+                select(Attack).where(Attack.id == parent.parent_attack_id)
+            )
+        ).scalars().first()
+        assert grandparent is not None
+        assert grandparent.strategy_name == evolved.strategy_name
+        assert EVOLVED_MARKER not in grandparent.prompt_text
+
+        # Blocked payloads: 5 static + round-6 root + round-6 2nd turn => 7.
         base_payloads = [
             a
             for a in attacks
             if EVOLVED_MARKER not in a.prompt_text
         ]
-        assert len(base_payloads) == 6
+        assert len(base_payloads) == 7
 
         vulns = list(
             (

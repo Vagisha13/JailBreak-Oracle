@@ -1,36 +1,51 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Jailbreak Oracle — Frontend
 
-## Getting Started
+Next.js 16 / React 19 dashboard for the Jailbreak Oracle red-teaming platform.
+Authenticates against the FastAPI backend, starts and monitors campaigns, and
+renders findings, mutation trees, budgets, and reports.
 
-First, run the development server:
+## Stack
+
+- Next.js 16 (App Router), React 19, TypeScript
+- Tailwind CSS v4
+- Axios (`src/lib/api.ts`) with JWT bearer attach and 401 logout/redirect
+- Vitest smoke tests for the API client
+
+## Requirements
+
+- Node `>=20` (the Dockerfile builds on `node:20-alpine`)
+
+## Development
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+npm run dev        # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+The app calls `NEXT_PUBLIC_API_URL || http://localhost:8000/api/v1`. Set
+`NEXT_PUBLIC_API_URL` to point at a deployed backend.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+npm run lint       # eslint
+npx tsc --noEmit   # typecheck
+npm test           # vitest (src/lib/api.test.ts)
+npm run build      # production build
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Security
 
-## Learn More
+- `next.config.ts` disables the `X-Powered-By` header and applies OWASP-style
+  response headers to every route (HSTS, `X-Frame-Options: SAMEORIGIN`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy`,
+  `Permissions-Policy`).
+- Auth tokens live in `localStorage` (`oracle_token`/`oracle_user`); the axios
+  response interceptor clears them and redirects to `/login` on any 401.
 
-To learn more about Next.js, take a look at the following resources:
+## Layout
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```
+src/lib/api.ts        axios client + interceptors (unit-tested)
+src/lib/types.ts      shared API types
+src/app/...           App Router pages (/, /login, /campaigns, /reports)
+src/components/...    UI components
+```

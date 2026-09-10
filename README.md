@@ -8,7 +8,8 @@ plus reproducible benchmarks.
 - **Backend**: FastAPI (Python 3.11), SQLAlchemy 2 async, Pydantic v2, Redis
   job queue + worker, PostgreSQL + pgvector (SQLite supported for dev/tests).
 - **Frontend**: Next.js 16 / React 19 (dashboard, campaigns, reports, findings,
-  mutation tree, budget panel).
+  mutation tree, budget panel); security headers, `poweredByHeader` off, and a
+  Vitest smoke suite for the API client.
 - **Agents**: Attacker, Evaluator, Verifier (dual verification), Defender.
 - **Governance**: per-campaign cost budgets with tripwires, rate limiting with
   trusted-proxy enforcement, role-based access control (admin/researcher),
@@ -113,6 +114,7 @@ Copy `backend/.env.example` to `backend/.env` and edit. Key settings:
 | `MAX_CAMPAIGN_COST` | Global USD cap enforced per campaign (budget tripwire). |
 | `TRUSTED_PROXIES` | Comma-separated proxy IPs/CIDRs trusted to set `X-Forwarded-For` for rate limiting. Empty disables XFF trust. |
 | `BOOTSTRAP_ADMIN_EMAILS` | Emails promoted to `admin` on registration (admin user-management API). |
+| `ALLOW_REGISTRATION` | `true` allows self-registration; `false` makes `/auth/register` return 403 (admin-provisioned accounts only). |
 | `REDIS_URL` | Redis connection for the queue worker + distributed rate limiting (required in production). |
 
 ## Development commands
@@ -151,6 +153,12 @@ All data routes require a Bearer JWT; ownership is enforced per user project
 - Isolated tests: the suite redirects to a temporary SQLite DB in
   `backend/tests/conftest.py` and never touches the dev/production database.
   Set `TEST_DATABASE_URL` for a dedicated Postgres test instance if desired.
+- Real-provider validation: `python scripts/validate_real_providers.py` runs a
+  tiny consent-gated campaign against your configured LiteLLM models
+  (`--probe-only` for a single connectivity check). Credentials are read from
+  `.env.local`; nothing sensitive is printed.
+- Frontend smoke tests: `npm test` (Vitest) covers the API client's base-URL
+  resolution, bearer-token attach, and 401 logout/redirect behavior.
 - CI (`.github/workflows/ci.yml`) runs backend lint + typecheck + tests +
   benchmark gate, and frontend lint + build. `make check` reproduces the
   backend job locally.
@@ -162,7 +170,7 @@ backend/app/            FastAPI application package (main.py, api/, core/, db/,
                         models/, schemas/, agents/, strategies/, services/, targets/)
 backend/alembic/        Migrations (Postgres-safe; SQLite-friendly env guards)
 backend/benchmarks/     Pure metric math + reproducible benchmark harness
-backend/tests/          25+ test modules (152+ tests)
+backend/tests/          34 test modules (205 tests), temp SQLite isolation
 frontend/               Next.js 16 application
 docker-compose.yml      Full stack (db, redis, backend, worker, frontend)
 Makefile                Developer task runner

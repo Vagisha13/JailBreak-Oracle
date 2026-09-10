@@ -344,3 +344,93 @@ Commit `c2fe7b4 "uhhhh"`. **152/152 tests pass** (baseline verified at the start
 New tests: `tests/test_observability.py` (9) — key-value/Bearer/JWT/`sk-` masking, single-pass redaction (no `=***=***` cascade), whitelist enforcement (unknown extras dropped), `provider.llm_call` event shape, wrapper `provider.llm_error` campaign context, and no double-logging on success.
 
 Still open (deliberate, non-blocking): Docker image builds could not be smoke-tested on this machine (Docker daemon unavailable; only `docker compose config` was verifiable).
+
+---
+
+## 21. Phase 14 — Final validation, benchmarking & hackathon readiness (2026-09-10)
+
+**205/205 backend tests pass** (34 test modules). `flake8` clean (app + tests +
+benchmarks + scripts), `mypy` clean (67 files). Frontend: `npm run lint`,
+`npx tsc --noEmit`, `npm run build` (8 routes) and `npm test` (Vitest, 5 tests)
+all green. Benchmark reproducible (`reproducible=yes`).
+
+| Gate | Result |
+|---|---|
+| pytest | 205 passed, 40s |
+| flake8 | 0 issues |
+| mypy | no issues in 67 files |
+| frontend lint / tsc / build | clean |
+| frontend vitest | 5 passed |
+| benchmark | reproducible, `run_id=013e85e4ca5741458923c3af861bf04b` |
+
+### Feature freeze + mutation/round metric extension (Step 4)
+Benchmarks now report mutation retries and rounds-to-success alongside the
+classic metrics. Final ablation matrix (10-scenario catalog):
+
+| config | attacks | vulns | verified | success% | mutation% | roundsToOK |
+|---|---|---|---|---|---|---|
+| baseline | 10 | 6 | 2 | 60.0 | 0.0 | 5.8 |
+| no_verification | 10 | 6 | 0 | 60.0 | 0.0 | 5.8 |
+| mutation_retry | 14 | 10 | 0 | 71.4 | 100.0 | 5.5 |
+| full | 14 | 10 | 3 | 71.4 | 100.0 | 5.5 |
+
+### Real-provider validation (Step 3)
+`backend/scripts/validate_real_providers.py` (new, git-friendly: env keys
+present/absent only — never values, `.env.local` never committed) ran a tiny
+consent-gated `gpt-4o-mini` campaign end-to-end:
+
+- Connectivity probe: `OK: model replied with 'OK'`.
+- 6-round campaign **COMPLETED**: 28 real LLM calls, 28,991 tokens,
+  **$0.008** actual spend under the $1 cap; every round generated/executed/
+  evaluated against a real target; all rounds correctly blocked (aligned model)
+  → 0 findings, as expected and honestly reported.
+- Fix surfaced: the attacker's first real call was refused by gpt-4o-mini
+  ("I'm sorry...") because the generation prompt lacked authorized-lab context,
+  failing the round. `AttackerAgent` now prepends an authorized-red-team
+  preamble to root and mutation prompts (single point in `app/agents/attacker.py`).
+  Mock/CI behavior is untouched (deterministic catalog does not use LLM prompts).
+
+### Stateful resume + budget resilience (Steps 5–6, Scenarios D–E)
+New regression tests: `test_resume_produces_no_duplicate_result_artifacts`
+(one AttackResult per Attack across a resumed run) and
+`test_provider_failure_within_resumed_run_preserves_prior_artifacts`
+(orchestrator crash mid-resume leaves rounds 1–2 exactly as persisted).
+Budget-accounting test `test_provider_exception_does_not_corrupt_accounting`
+covers provider exceptions wrapping cleanly. Earlier-context discoveries
+corrected in test expectations (mutation attempt count = 4 blocked scenarios;
+delegate patching must target `orchestrator._attacker_provider`, not the agent).
+
+### Security pass (Steps 7–8)
+- `ALLOW_REGISTRATION` flag: `/auth/register` returns 403 when disabled;
+  dedicated API test added (`test_registration_disabled_when_flag_off`).
+- Structured-logging bypass fixed in `reports.py` and `vulnerabilities.py`
+  routers (they used `logging.getLogger` directly, evading the redaction
+  whitelist) — now use `get_logger("api.*")`.
+- Frontend: `next.config.ts` disables `X-Powered-By` and applies OWASP response
+  headers on all routes; engines pinned to `">=20"` (matches `node:20-alpine`
+  images); dead create-next-app SVGs and unused `clsx`/`tailwind-merge` deps
+  removed; custom `error.tsx` / `not-found.tsx` added (Next 16 `retry` prop
+  convention per bundled docs).
+
+### Final matrix
+
+| Capability (from task.md claim) | Status | Evidence |
+|---|---|---|
+| Adaptive campaigns (observe→plan→attack→evaluate→learn→mutate→verify→record) | ✅ | `services/campaign.py`, lifecycle tests |
+| Multi-strategy catalog + registry | ✅ | 7 strategies under `strategies/`, `list_strategies()` |
+| Feedback-driven mutation + multi-turn lineage | ✅ | `AdaptiveMutationStrategy`, `MultiTurnStrategy`, `conversation.py` |
+| Independent dual verification | ✅ | `VerifierAgent` + `verification.py`, ablation shows verified>0 |
+| Cost budgets w/ tripwire + ledger | ✅ | `budget.py`, 12 tests |
+| Durable queue + worker + lease + heartbeat recovery | ✅ | `queue.py`, `lease.py`, E-25 heartbeat, stale-resume tests |
+| RBAC + trusted-proxy rate limiting | ✅ | `authz_admin` (10) + `rate_limiting` (+4) |
+| Analytics + reproducible benchmarks | ✅ | `benchmarks/`, `analytics.py`, ablation matrix |
+| Frontend campaign/report/mutation views | ✅ | 8 routes build, vitest smoke suite |
+| Real-provider (non-mock) pipeline | ✅ | gpt-4o-mini validation run (COMPLETED) |
+
+**Executive verdict**: development is **feature-frozen** and demo-ready. All
+claims in the tracker are implemented and gated. The ONLY honest limitations are
+documented: aligned production models typically refuse the attack payloads they
+would need to succeed (so real-provider demos yield refusals and 0 findings),
+and Docker image *builds* were not smoke-tested on this machine.
+
+See `docs/FINAL_REPORT.md` for the full readiness report.

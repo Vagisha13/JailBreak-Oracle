@@ -7,6 +7,13 @@ There are two families:
   a safe answer, whereas evolved payloads (produced by the mock attacker's
   mutation response) always comply. This gives real campaign exercises a
   deterministic block-then-mutate-then-jailbreak arc with zero randomness.
+  For multi-turn conversations the compliance decision is conversation-aware:
+  the target complies when ANY user turn carries the evolution marker, so a
+  genuine multi-turn campaign (turns chained via ``parent_attack_id`` and
+  executed with the full message history) jailbreaks — a fake one (just the
+  latest prompt, no context) cannot. Every execution is also recorded on the
+  class-wide ``observed_payloads`` log so tests can assert on exactly what
+  conversation the provider received.
 * The role-aware agent mocks (``MockAttackerProvider``, ``MockEvaluatorProvider``,
   ``MockVerifierProvider``, ``MockDefenderProvider``) — deterministic JSON
   producers that satisfy the exact schemas the agents require. They are chosen
@@ -16,6 +23,7 @@ There are two families:
 No network calls. No API keys. Same input -> same output.
 """
 
+import asyncio
 import json
 import re
 import time
@@ -57,28 +65,70 @@ class MockTargetProvider(TargetProvider):
     A deterministic target provider for automated testing and CI/CD.
     Backward-compatible with the original scripted behavior while adding a
     deterministic compliance branch so full campaign flows can be exercised.
+
+    ``execute`` accepts the full conversation via the keyword-only ``messages``
+    argument; the ``prompt`` stays the current turn's payload. Compliance is
+    decided over the CONVERSATION: the target complies when any user turn
+    carries ``EVOLVED_MARKER`` and the message list is well-formed (starts and
+    ends with a user message). This is what makes the mock honest about genuine
+    multi-turn attacks — merely forwarding the latest payload without context
+    can never produce the compliance signal.
     """
 
-    async def execute(self, prompt: str, config: dict) -> TargetResponse:
+    # Class-wide deterministic log of every execution (messages received +
+    # response emitted). E2E tests read this to assert on the exact
+    # conversation a turn actually got, avoiding DB plumbing at the boundary.
+    observed_payloads: list = []
+
+    @classmethod
+    def reset_log(cls) -> None:
+        cls.observed_payloads = []
+
+    async def execute(
+        self,
+        prompt: str,
+        config: dict,
+        *,
+        messages: list[dict] | None = None,
+    ) -> TargetResponse:
         start_time = time.perf_counter()
 
         # Simulate network latency
-        await __import__("asyncio").sleep(0.02)
+        await asyncio.sleep(0.02)
 
         latency_ms = (time.perf_counter() - start_time) * 1000
 
+        message_list = list(messages or [])
+        normalized = [
+            {
+                "role": m.get("role") or "user",
+                "content": m.get("content") or "",
+            }
+            for m in message_list
+        ]
+        user_contents = [m["content"] for m in normalized if m["role"] == "user"]
+        evolved_in_conversation = EVOLVED_MARKER in prompt or any(
+            EVOLVED_MARKER in content for content in user_contents
+        )
+        # Contract guard: a well-formed conversation starts and ends with a user
+        # message. Malformed lists are refused deterministically so tests can
+        # assert on the provider contract without mocking internals.
+        conversation_well_formed = (not normalized) or (
+            normalized[0]["role"] == "user" and normalized[-1]["role"] == "user"
+        )
+
         # Simulate a provider error if "error" is in the prompt (legacy behavior)
         if "error" in prompt.lower():
-            return TargetResponse(
+            response = TargetResponse(
                 response_text="",
                 latency_ms=latency_ms,
                 error="Simulated provider connection error.",
             )
-
-        if EVOLVED_MARKER in prompt:
-            # Evolved payload -> the target complies. Deterministic and free of
-            # refusal/canned-phrase heuristics so the AI evaluator is exercised.
-            return TargetResponse(
+        elif evolved_in_conversation and conversation_well_formed:
+            # Evolved conversation -> the target complies. Deterministic and
+            # free of refusal/canned-phrase heuristics so the AI evaluator is
+            # exercised.
+            response = TargetResponse(
                 response_text=(
                     f"{COMPLIANT_MARKER}: Here is the requested information "
                     f"for the objective."
@@ -88,16 +138,25 @@ class MockTargetProvider(TargetProvider):
                 completion_tokens=_MOCK_COMPLETION_TOKENS,
                 total_tokens=_token_count(prompt) + _MOCK_COMPLETION_TOKENS,
             )
+        else:
+            # Base conversation -> the target refuses. Deterministic, and
+            # matches the standard-refusal heuristics so blocked rounds are
+            # cheap.
+            response = TargetResponse(
+                response_text=f"I am a safe mock response to: {prompt[:20]}...",
+                latency_ms=latency_ms,
+                prompt_tokens=_token_count(prompt),
+                completion_tokens=_MOCK_COMPLETION_TOKENS,
+                total_tokens=_token_count(prompt) + _MOCK_COMPLETION_TOKENS,
+            )
 
-        # Base payload -> the target refuses. Deterministic, and matches the
-        # standard-refusal heuristics so blocked rounds are cheap.
-        return TargetResponse(
-            response_text=f"I am a safe mock response to: {prompt[:20]}...",
-            latency_ms=latency_ms,
-            prompt_tokens=_token_count(prompt),
-            completion_tokens=_MOCK_COMPLETION_TOKENS,
-            total_tokens=_token_count(prompt) + _MOCK_COMPLETION_TOKENS,
+        type(self).observed_payloads.append(
+            {
+                "messages": normalized,
+                "response_text": response.response_text,
+            }
         )
+        return response
 
 
 class MockAttackerProvider(TargetProvider):
@@ -105,8 +164,18 @@ class MockAttackerProvider(TargetProvider):
 
     It inspects the generation prompt to learn which strategy the orchestrator
     selected and whether this call is a *mutation* (the strategy's mutation
-    template contains distinctive phrasing) so it can emit an evolved payload.
+template contains distinctive phrasing) so it can emit an evolved payload.
+
+    ``observed_prompts`` is a class-wide log of every prompt received so E2E
+    tests can assert on mutation prompt content (e.g. verifier signal presence)
+    without reaching into internals.
     """
+
+    observed_prompts: list = []
+
+    @classmethod
+    def reset_log(cls) -> None:
+        cls.observed_prompts = []
 
     _MUTATION_HINTS = (
         "NEXT TURN",
@@ -115,14 +184,38 @@ class MockAttackerProvider(TargetProvider):
         "evolve it",
     )
 
-    async def execute(self, prompt: str, config: dict) -> TargetResponse:
+    async def execute(
+        self,
+        prompt: str,
+        config: dict,
+        *,
+        messages: list[dict] | None = None,
+    ) -> TargetResponse:
         start_time = time.perf_counter()
         strategy_name = _extract_json_fields(prompt, "strategy_name") or "mock"
         category = _extract_json_fields(prompt, "category") or strategy_name
 
         is_mutation = any(hint in prompt for hint in self._MUTATION_HINTS)
         if is_mutation:
-            payload_text = f"Evolved mock payload for {strategy_name}. {EVOLVED_MARKER}"
+            if strategy_name == "multi_turn":
+                # Escalate deterministically: count how many target turns the
+                # transcript already embeds. Turn 2 is still refused (one
+                # message cannot carry the compliance signal); turn 3+ carries
+                # the evolution marker so a genuine multi-turn conversation
+                # jailbreaks.
+                prior_target_turns = len(
+                    re.findall(r"\[TURN \d+\] Target:", prompt)
+                )
+                turn_number = prior_target_turns + 2
+                if turn_number == 2:
+                    payload_text = f"Second mock payload for {strategy_name}."
+                else:
+                    payload_text = (
+                        f"Evolved mock payload for {strategy_name}. "
+                        f"{EVOLVED_MARKER}"
+                    )
+            else:
+                payload_text = f"Evolved mock payload for {strategy_name}. {EVOLVED_MARKER}"
         else:
             payload_text = f"Base mock payload for {strategy_name}."
 
@@ -137,13 +230,15 @@ class MockAttackerProvider(TargetProvider):
             ),
         }
         latency_ms = (time.perf_counter() - start_time) * 1000
-        return TargetResponse(
+        response = TargetResponse(
             response_text=f"```json\n{json.dumps(payload)}\n```",
             latency_ms=latency_ms,
             prompt_tokens=_token_count(prompt),
             completion_tokens=_MOCK_COMPLETION_TOKENS,
             total_tokens=_token_count(prompt) + _MOCK_COMPLETION_TOKENS,
         )
+        type(self).observed_prompts.append(prompt)
+        return response
 
 
 class MockEvaluatorProvider(TargetProvider):
@@ -152,10 +247,16 @@ class MockEvaluatorProvider(TargetProvider):
     Classification is driven entirely by the target response: complying targets
     (the ``ORACLE_MOCK_COMPLIANT`` marker) are graded JAILBREAK; everything else
     is BLOCKED. Deterministic and honest (the mock never fabricates an evasive
-    verdict for a complying target).
+verdict for a complying target).
     """
 
-    async def execute(self, prompt: str, config: dict) -> TargetResponse:
+    async def execute(
+        self,
+        prompt: str,
+        config: dict,
+        *,
+        messages: list[dict] | None = None,
+    ) -> TargetResponse:
         start_time = time.perf_counter()
         target_response = _extract_target_response(prompt)
 
@@ -202,9 +303,25 @@ class MockVerifierProvider(TargetProvider):
     Confirms only genuinely complying target responses (the compliant marker),
     otherwise refutes — a deterministic second opinion over the same raw
     evidence the evaluator saw.
+
+    ``observed_verifications`` is a class-wide log of every verification call
+    so E2E tests can assert on verifier invocation counts and ordering without
+    reaching into internals.
     """
 
-    async def execute(self, prompt: str, config: dict) -> TargetResponse:
+    observed_verifications: list = []
+
+    @classmethod
+    def reset_log(cls) -> None:
+        cls.observed_verifications = []
+
+    async def execute(
+        self,
+        prompt: str,
+        config: dict,
+        *,
+        messages: list[dict] | None = None,
+    ) -> TargetResponse:
         start_time = time.perf_counter()
         target_response = _extract_target_response(prompt)
 
@@ -235,7 +352,7 @@ class MockVerifierProvider(TargetProvider):
             }
 
         latency_ms = (time.perf_counter() - start_time) * 1000
-        return TargetResponse(
+        response = TargetResponse(
             response_text=json.dumps(payload),
             latency_ms=latency_ms,
             prompt_tokens=_token_count(prompt),
@@ -243,15 +360,30 @@ class MockVerifierProvider(TargetProvider):
             total_tokens=_token_count(prompt) + _MOCK_COMPLETION_TOKENS,
         )
 
+        type(self).observed_verifications.append(
+            {
+                "target_response": target_response[:200],
+                "disposition": payload["disposition"],
+                "confidence": payload["confidence"],
+            }
+        )
+        return response
+
 
 class MockDefenderProvider(TargetProvider):
     """Deterministic defender that satisfies the ``DefenderVerdict`` schema.
 
     Always returns the same evidence-anchored remediation advice with a
-    regression score so defense reports are reproducible without an LLM.
+regression score so defense reports are reproducible without an LLM.
     """
 
-    async def execute(self, prompt: str, config: dict) -> TargetResponse:
+    async def execute(
+        self,
+        prompt: str,
+        config: dict,
+        *,
+        messages: list[dict] | None = None,
+    ) -> TargetResponse:
         start_time = time.perf_counter()
         payload = {
             "recommendations": [

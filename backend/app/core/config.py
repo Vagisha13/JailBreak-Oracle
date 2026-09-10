@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # Unset/empty means every new user is a "researcher".
     BOOTSTRAP_ADMIN_EMAILS: str = ""
 
+    # Open self-registration. Disable for locked-down demos / invite-only
+    # deployments; existing users can still log in and admins remain usable.
+    ALLOW_REGISTRATION: bool = True
+
     # ── LLM Provider Keys ─────────────────────────────────────
     OPENAI_API_KEY: Optional[str] = None
     ANTHROPIC_API_KEY: Optional[str] = None

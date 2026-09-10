@@ -44,6 +44,11 @@ class Token(BaseModel):
 
 @router.post("/register", response_model=Token, status_code=status.HTTP_201_CREATED)
 async def register(data: UserCreate):
+    if not settings.ALLOW_REGISTRATION:
+        raise HTTPException(
+            status_code=403,
+            detail="Self-registration is disabled. Ask an administrator for an account.",
+        )
     email = data.email.strip().lower()
     async with AsyncSessionLocal() as session:
         existing = await session.execute(select(User).where(User.email == email))

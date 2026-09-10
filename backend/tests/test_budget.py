@@ -161,6 +161,48 @@ async def test_wrapper_uses_config_model_name():
     assert entry.model == "gpt-4o-mini"
 
 
+@pytest.mark.asyncio
+async def test_provider_exception_does_not_corrupt_accounting():
+    """A provider that raises must not record phantom spend, and later
+    successful calls must still be billed exactly (E-12: no corrupt ledger)."""
+
+    class FlakyProvider(TargetProvider):
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, prompt: str, config: dict) -> TargetResponse:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient provider outage")
+            return TargetResponse(
+                response_text="ok",
+                latency_ms=1.0,
+                prompt_tokens=1000,
+                completion_tokens=500,
+            )
+
+    tracker = TokenTracker()
+    delegate = FlakyProvider()
+    wrapped = BudgetedTargetProvider(
+        delegate=delegate, tracker=tracker, role="attacker", default_model="gpt-4o-mini"
+    )
+
+    with pytest.raises(RuntimeError):
+        await wrapped.execute("hello", {})
+
+    # The failed call left no trail: zero entries, zero spend.
+    assert delegate.calls == 1
+    assert tracker.entries == []
+    assert tracker.total_tokens == 0
+    assert tracker.as_telemetry()["total_cost_usd"] == 0.0
+
+    # The retry is billed exactly once (gpt-4o-mini: 1000*0.00015 + 500*0.0006).
+    result = await wrapped.execute("hello", {})
+    assert result.response_text == "ok"
+    assert len(tracker.entries) == 1
+    assert tracker.total_cost_usd == pytest.approx(0.00015 + 0.0003, abs=1e-8)
+
+
 # --- Orchestrator integration ---
 
 

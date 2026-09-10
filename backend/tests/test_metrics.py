@@ -6,6 +6,7 @@ import pytest
 from benchmarks.metrics import (
     add_attack,
     add_finding,
+    add_mutation_attempt,
     aggregate_inputs,
     compute_metrics,
 )
@@ -63,6 +64,51 @@ def test_unknown_severity_falls_back_to_low():
     d = compute_metrics(inputs).to_dict()
     assert d["severity_breakdown"]["LOW"] == 1
     assert d["severity_breakdown"]["HIGH"] == 0
+
+
+def test_compute_metrics_mutation_rate_and_rounds():
+    inputs = aggregate_inputs()
+    # Round 3 blocked -> one successful mutation retry (same round).
+    add_attack(inputs, strategy="multi_turn", success=False, round_number=3)
+    add_mutation_attempt(inputs, success=True)
+    add_attack(inputs, strategy="multi_turn", success=True, round_number=3)
+    add_finding(inputs, severity="HIGH", verified_status=None)
+    # Round 7 blocked -> one failed mutation attempt then success next round.
+    add_attack(inputs, strategy="roleplay", success=False, round_number=7)
+    add_mutation_attempt(inputs, success=False)
+    add_attack(inputs, strategy="roleplay", success=False, round_number=8)
+    add_mutation_attempt(inputs, success=True)
+    add_attack(inputs, strategy="roleplay", success=True, round_number=8)
+    add_finding(inputs, severity="MEDIUM", verified_status=None)
+
+    m = compute_metrics(inputs, num_experiments=1)
+    assert m.mutations_attempted == 3
+    assert m.mutations_successful == 2
+    assert m.mutation_success_rate == pytest.approx(66.6667, abs=0.01)
+    # Successful attacks landed in rounds 3 and 8 -> avg 5.5.
+    assert m.avg_rounds_to_success == pytest.approx(5.5, abs=1e-9)
+    assert m.to_dict()["mutations_attempted"] == 3
+
+
+def test_benchmark_ablations_report_mutation_and_rounds():
+    report = run_benchmark()
+    by_name = {r.config_name: r.metrics for r in report.ablations}
+
+    # Baseline has no mutation retries and no mutation metrics.
+    assert by_name["baseline"].mutations_attempted == 0
+    assert by_name["baseline"].mutation_success_rate == 0.0
+    assert by_name["baseline"].avg_rounds_to_success > 0.0
+
+    # The 10-scenario catalog has exactly 4 blocked scenarios; the mutation
+    # configs retry all of them successfully in the same round.
+    full = by_name["full"]
+    assert full.mutations_attempted == 4
+    assert full.mutations_successful == 4
+    assert full.mutation_success_rate == 100.0
+    assert full.avg_rounds_to_success == pytest.approx(5.5, abs=1e-9)
+
+    mutation_retry = by_name["mutation_retry"]
+    assert mutation_retry.mutations_attempted == full.mutations_attempted
 
 
 @pytest.mark.parametrize(

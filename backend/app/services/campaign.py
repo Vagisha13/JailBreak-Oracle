@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 
 from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
 
 from app.db.session import AsyncSessionLocal
 from app.models.domain import (
@@ -16,6 +17,7 @@ from app.schemas.campaign import CampaignConfig, CampaignSummary
 from app.agents.attacker import AttackerAgent
 from app.agents.evaluator import EvaluatorAgent
 from app.agents.verifier import VerifierAgent
+from app.agents.verifier import VerifierVerdict
 from app.services.budget import (
     BudgetExceededError,
     BudgetedTargetProvider,
@@ -35,7 +37,7 @@ from app.services.lease import (
     renew,
 )
 from app.strategies.registry import get_strategy, list_strategies
-from app.schemas.feedback import AttackFeedback
+from app.schemas.feedback import AttackFeedback, verifier_signal_tag
 from app.services.mutation import MutationEngine
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -273,16 +275,19 @@ class CampaignOrchestrator:
 
             # 5. Rehydrate round progress from the DB so a resumed campaign
             #    continues where it stopped (worker restart / retry-safe).
-            starting_round, strategies_used, strategy_scores = (
+            #    Mutations are costly LLM calls â€” cap them to avoid runaway spend.
+            mutation_budget = max(1, (config.attack_budget or 1) // 2)
+            mutation_attempts = 0
+            starting_round, strategies_used, strategy_scores, resume_chain = (
                 await self._load_progress(
-                    config.experiment_id, config.max_rounds, available_strategies
+                    config.experiment_id,
+                    config.max_rounds,
+                    available_strategies,
+                    mutation_budget,
                 )
             )
             if not strategies_used:
                 strategies_used = set()
-            # Mutations are costly LLM calls â€” cap them to avoid runaway spend.
-            mutation_budget = max(1, (config.attack_budget or 1) // 2)
-            mutation_attempts = 0
 
             for round_num in range(starting_round, config.max_rounds + 1):
                 rounds_executed = round_num
@@ -291,56 +296,95 @@ class CampaignOrchestrator:
                 # its heartbeat every round so recovery never sweeps it.
                 await self._bump_heartbeat(config.experiment_id)
 
-                # PLAN: explore new strategies vs. exploit the best-scoring one.
-                strategy = self._select_strategy(
-                    config, available_strategies, strategies_used, strategy_scores
-                )
-                strategy_name = strategy.name
-                strategies_used.add(strategy_name)
-
-                # ATTACK: Generate adversarial prompt
-                attack = await self.attacker_agent.generate_and_persist_attack(
-                    strategy=strategy,
-                    objective=config.objective,
-                    experiment_id=config.experiment_id,
-                    round_number=round_num,
-                )
-                logger.info(
-                    "Attack generated",
-                    extra={
-                        "event_name": "campaign.attack_generated",
-                        "campaign_id": str(config.experiment_id),
-                        "strategy": strategy_name,
-                        "iteration": round_num,
-                    },
-                )
-                await self._record_agent_run(
-                    config.experiment_id,
-                    "attacker",
-                    {"round": round_num, "strategy": strategy_name, "attack_id": str(attack.id)},
+                # Resuming an interrupted round? Its last turn was BLOCKED and
+                # the chain is still mutation-eligible: reuse the persisted
+                # chain (no fresh root), force the SAME strategy, and re-enter
+                # the mutation loop so the conversation continues where the
+                # previous worker stopped.
+                resumed_turn = bool(
+                    resume_chain and resume_chain["round"] == round_num
                 )
 
-                # EXECUTE: Send to target
-                exec_summary = await self.execution_service.execute_attack(
-                    attack_id=attack.id,
-                    target_id=config.target_id,
-                )
-                logger.info(
-                    "Attack executed",
-                    extra={
-                        "event_name": "campaign.attack_executed",
-                        "campaign_id": str(config.experiment_id),
-                        "strategy": strategy_name,
-                        "iteration": round_num,
-                        "status": "error" if exec_summary.error else "success",
-                    },
-                )
+                if resumed_turn:
+                    assert resume_chain is not None
+                    strategy = get_strategy(resume_chain["strategy_name"])
+                    strategy_name = strategy.name
+                    strategies_used.add(strategy_name)
+                    attack = await self._load_attack(resume_chain["attack_id"])
+                    if attack is None:
+                        raise ValueError(
+                            f"Resumed chain attack {resume_chain['attack_id']} not found."
+                        )
+                    chain_response = resume_chain["target_response"]
+                    exec_summary = None
+                else:
+                    # PLAN: explore new strategies vs. exploit the best-scoring one.
+                    strategy = self._select_strategy(
+                        config, available_strategies, strategies_used, strategy_scores
+                    )
+                    strategy_name = strategy.name
+                    strategies_used.add(strategy_name)
 
-                # EVALUATE: Grade the response
-                eval_summary = await self.evaluation_service.evaluate_result(
-                    result_id=exec_summary.attack_result_id,
-                    attack_objective=config.objective,
-                )
+                    # ATTACK: Generate adversarial prompt
+                    attack = await self.attacker_agent.generate_and_persist_attack(
+                        strategy=strategy,
+                        objective=config.objective,
+                        experiment_id=config.experiment_id,
+                        round_number=round_num,
+                    )
+                    logger.info(
+                        "Attack generated",
+                        extra={
+                            "event_name": "campaign.attack_generated",
+                            "campaign_id": str(config.experiment_id),
+                            "strategy": strategy_name,
+                            "iteration": round_num,
+                        },
+                    )
+                    await self._record_agent_run(
+                        config.experiment_id,
+                        "attacker",
+                        {"round": round_num, "strategy": strategy_name, "attack_id": str(attack.id)},
+                    )
+
+                    # EXECUTE: Send to target. ExecutionService resolves the
+                    # conversation lineage and sends every prior turn plus the
+                    # target's response to it, ending with this turn's prompt.
+                    exec_summary = await self.execution_service.execute_attack(
+                        attack_id=attack.id,
+                        target_id=config.target_id,
+                    )
+                    logger.info(
+                        "Attack executed",
+                        extra={
+                            "event_name": "campaign.attack_executed",
+                            "campaign_id": str(config.experiment_id),
+                            "strategy": strategy_name,
+                            "iteration": round_num,
+                            "status": "error" if exec_summary.error else "success",
+                        },
+                    )
+                    chain_response = exec_summary.target_response or ""
+
+                if attack is None:
+                    raise RuntimeError(
+                        f"Round {round_num} produced no attack row to evaluate."
+                    )
+
+                # EVALUATE: Grade the response (fresh execution, or the persisted
+                # last-turn result when the round is being resumed).
+                if resumed_turn:
+                    assert resume_chain is not None
+                    eval_summary = await self.evaluation_service.evaluate_result(
+                        result_id=resume_chain["result_id"],
+                        attack_objective=config.objective,
+                    )
+                else:
+                    assert exec_summary is not None
+                    eval_summary = await self.evaluation_service.evaluate_result(
+                        result_id=exec_summary.attack_result_id,
+                        attack_objective=config.objective,
+                    )
                 logger.info(
                     "Attack evaluated",
                     extra={
@@ -370,72 +414,58 @@ class CampaignOrchestrator:
                     strategy_scores[strategy_name] = strategy_scores.get(strategy_name, 0.0) + 1.0
 
                     # VERIFY: Independent confirmation
-                    if self.verification_service and eval_summary.vulnerability_id:
-                        try:
-                            verified = await self.verification_service.verify_vulnerability(
-                                eval_summary.vulnerability_id
-                            )
-                        except Exception:
-                            verified = None
-                        confirmed = bool(
-                            verified
-                            and verified.verified_status
-                            == "CONFIRMED_VULNERABILITY"
-                        )
-                        await self._record_agent_run(
-                            config.experiment_id,
-                            "verifier",
-                            {
-                                "round": round_num,
-                                "attack_id": str(attack.id),
-                                "vulnerability_id": str(eval_summary.vulnerability_id),
-                                "verified_status": (
-                                    verified.verified_status if verified else "ERROR"
-                                ),
-                                "agreement": confirmed,
-                            },
-                        )
-                        logger.info(
-                            "Evaluator-verifier agreement recorded",
-                            extra={
-                                "event_name": "verification.agreement",
-                                "campaign_id": str(config.experiment_id),
-                                "vulnerability_id": str(
-                                    eval_summary.vulnerability_id
-                                ),
-                                "evaluator_verdict": "JAILBREAK",
-                                "verifier_status": (
-                                    verified.verified_status if verified else "ERROR"
-                                ),
-                                "agreement": confirmed,
-                            },
-                        )
+                    await self._verify_vulnerability_with_telemetry(
+                        config.experiment_id, attack.id, round_num, eval_summary
+                    )
 
                     if config.stop_on_first_success:
                         break
                 else:
                     consecutive_failures += 1
 
-                    # MUTATE + RETRY: evolve the blocked prompt using feedback.
-                    if (
+                    # MUTATE + RETRY: keep escalating the blocked conversation
+                    # turn-by-turn until it lands, the budget is exhausted, or
+                    # the attacker deduplicates. Each mutation chains off the
+                    # previous turn, so the executed conversation (lineage)
+                    # grows genuinely longer with every attempt.
+                    chain_success = False
+                    current_attack = attack
+                    while (
                         strategy.supports_mutation
                         and mutation_attempts < mutation_budget
                     ):
+                        # VERIFY: blind independent second opinion on the
+                        # blocked attack to inform mutation (Phase 4).
+                        feedback_verifier = (
+                            await self._verify_attack_for_feedback(
+                                config.experiment_id,
+                                current_attack.id,
+                                round_num,
+                            )
+                        )
+
                         feedback = AttackFeedback(
-                            attack_id=attack.id,
-                            prompt_text=attack.prompt_text,
-                            target_response=exec_summary.target_response or "",
+                            attack_id=current_attack.id,
+                            prompt_text=current_attack.prompt_text,
+                            target_response=chain_response,
                             is_jailbreak=False,
                             severity=eval_summary.verdict.severity,
                             category=eval_summary.verdict.category,
                             confidence=eval_summary.verdict.confidence,
                             reasoning=eval_summary.verdict.reasoning,
+                            verifier=feedback_verifier,
+                            verifier_result=(
+                                f"{feedback_verifier.disposition.value} "
+                                f"({feedback_verifier.confidence:.2f})"
+                                if feedback_verifier
+                                else None
+                            ),
                             mutation_type=strategy_name,
                         )
                         last_attack = {
-                            "id": attack.id,
-                            "prompt_text": attack.prompt_text,
-                            "strategy_name": attack.strategy_name,
+                            "id": current_attack.id,
+                            "prompt_text": current_attack.prompt_text,
+                            "strategy_name": current_attack.strategy_name,
                         }
                         mutated = await self.mutation_engine.mutate(
                             strategy=strategy,
@@ -447,54 +477,54 @@ class CampaignOrchestrator:
                         )
                         mutation_attempts += 1
 
-                        if mutated:
-                            mutated_exec = await self.execution_service.execute_attack(
-                                attack_id=mutated.id,
-                                target_id=config.target_id,
+                        if not mutated:
+                            break
+
+                        # EXECUTE + EVALUATE the new turn within the conversation
+                        # (ExecutionService sends the full lineage again).
+                        mutated_exec = await self.execution_service.execute_attack(
+                            attack_id=mutated.id,
+                            target_id=config.target_id,
+                        )
+                        mutated_eval = await self.evaluation_service.evaluate_result(
+                            result_id=mutated_exec.attack_result_id,
+                            attack_objective=config.objective,
+                        )
+                        await self._record_agent_run(
+                            config.experiment_id,
+                            "evaluator",
+                            {
+                                "round": round_num,
+                                "attack_id": str(mutated.id),
+                                "verdict": (
+                                    "jailbreak" if mutated_eval.verdict.is_jailbreak else "blocked"
+                                ),
+                                "severity": mutated_eval.verdict.severity,
+                                "category": mutated_eval.verdict.category,
+                            },
+                        )
+
+                        if mutated_eval.verdict.is_jailbreak:
+                            vulnerabilities_found += 1
+                            consecutive_failures = 0
+                            strategy_scores[strategy_name] = (
+                                strategy_scores.get(strategy_name, 0.0) + 1.0
                             )
-                            mutated_eval = await self.evaluation_service.evaluate_result(
-                                result_id=mutated_exec.attack_result_id,
-                                attack_objective=config.objective,
+                            chain_success = True
+                            await self._verify_vulnerability_with_telemetry(
+                                config.experiment_id,
+                                mutated.id,
+                                round_num,
+                                mutated_eval,
                             )
-                            if mutated_eval.verdict.is_jailbreak:
-                                vulnerabilities_found += 1
-                                consecutive_failures = 0
-                                strategy_scores[strategy_name] = (
-                                    strategy_scores.get(strategy_name, 0.0) + 1.0
-                                )
-                                if (
-                                    self.verification_service
-                                    and mutated_eval.vulnerability_id
-                                ):
-                                    try:
-                                        verified = await self.verification_service.verify_vulnerability(
-                                            mutated_eval.vulnerability_id
-                                        )
-                                    except Exception:
-                                        verified = None
-                                    await self._record_agent_run(
-                                        config.experiment_id,
-                                        "verifier",
-                                        {
-                                            "round": round_num,
-                                            "attack_id": str(mutated.id),
-                                            "vulnerability_id": str(
-                                                mutated_eval.vulnerability_id
-                                            ),
-                                            "verified_status": (
-                                                verified.verified_status
-                                                if verified
-                                                else "ERROR"
-                                            ),
-                                            "agreement": bool(
-                                                verified
-                                                and verified.verified_status
-                                                == "CONFIRMED_VULNERABILITY"
-                                            ),
-                                        },
-                                    )
-                                if config.stop_on_first_success:
-                                    break
+                            break
+
+                        # Blocked: continue the conversation from this turn.
+                        current_attack = mutated
+                        chain_response = mutated_exec.target_response or ""
+
+                    if config.stop_on_first_success and chain_success:
+                        break
 
             # Record per-round campaign state (DB-backed round bookkeeping).
             await self._record_agent_run(
@@ -591,13 +621,21 @@ class CampaignOrchestrator:
         experiment_id: uuid.UUID,
         max_rounds: int,
         available_strategies: list[str],
-    ) -> tuple[int, set[str], dict[str, float]]:
+        mutation_budget: int,
+    ) -> tuple[int, set[str], dict[str, float], dict | None]:
         """Hydrate round progress from the DB so a resumed or retried campaign
         continues where it stopped: returns the starting round, the set of
-        strategies already exercised, and per-strategy jailbreak scores."""
+        strategies already exercised, per-strategy jailbreak scores, and — when
+        the latest round holds a mutation chain whose last turn was BLOCKED and
+        is still evolution-eligible — a resume payload so the campaign re-enters
+        the mutation loop for that round instead of generating a fresh root."""
         async with AsyncSessionLocal() as session:
             attack_stmt = (
-                select(Attack.id, Attack.strategy_name, Attack.round_number)
+                select(
+                    Attack.id,
+                    Attack.strategy_name,
+                    Attack.round_number,
+                )
                 .where(Attack.experiment_id == experiment_id)
             )
             attack_rows = (await session.execute(attack_stmt)).all()
@@ -620,13 +658,174 @@ class CampaignOrchestrator:
                 .join(Attack, Attack.id == Vulnerability.attack_id)
                 .where(Attack.experiment_id == experiment_id)
             )
+            vuln_attack_ids: set[uuid.UUID] = set()
             for (attack_id,) in (await session.execute(vuln_stmt)).all():
+                vuln_attack_ids.add(attack_id)
                 strategy_name = name_by_id.get(attack_id, "")
                 if strategy_name in strategy_scores:
                     strategy_scores[strategy_name] += 1.0
 
-        starting_round = min(max_round + 1, max_rounds + 1)
-        return starting_round, strategies_used, strategy_scores
+            resume_chain: dict | None = None
+            if max_round >= 1 and max_round <= max_rounds:
+                round_stmt = (
+                    select(Attack)
+                    .where(
+                        Attack.experiment_id == experiment_id,
+                        Attack.round_number == max_round,
+                    )
+                    .options(selectinload(Attack.results))
+                    .order_by(Attack.created_at.asc(), Attack.id.asc())
+                )
+                round_attacks = list(
+                    (await session.execute(round_stmt)).scalars().all()
+                )
+                if round_attacks:
+                    # Reconstruct the linear mutation chain for the round, root
+                    # first (mutations always chain to their immediate parent).
+                    chain: list[Attack] = [round_attacks[0]]
+                    while True:
+                        chained_ids = {a.id for a in chain}
+                        nxt = next(
+                            (
+                                a
+                                for a in round_attacks
+                                if a.parent_attack_id == chain[-1].id
+                                and a.id not in chained_ids
+                            ),
+                            None,
+                        )
+                        if nxt is None:
+                            break
+                        chain.append(nxt)
+                    last = chain[-1]
+                    lineage_mutations = len(chain) - 1
+                    if (
+                        last.results
+                        and last.strategy_name in available_strategies
+                        and not any(a.id in vuln_attack_ids for a in chain)
+                        and get_strategy(last.strategy_name).supports_mutation
+                        and lineage_mutations < mutation_budget
+                    ):
+                        latest_result = max(
+                            last.results, key=lambda r: (r.created_at, r.id)
+                        )
+                        resume_chain = {
+                            "round": max_round,
+                            "attack_id": last.id,
+                            "prompt_text": last.prompt_text,
+                            "strategy_name": last.strategy_name,
+                            "result_id": latest_result.id,
+                            "target_response": latest_result.target_response or "",
+                        }
+
+        if resume_chain is not None:
+            # Re-run the interrupted round so the chain's mutation loop can
+            # continue (its last turn was blocked but is still evolving).
+            starting_round = resume_chain["round"]
+        else:
+            starting_round = min(max_round + 1, max_rounds + 1)
+        return starting_round, strategies_used, strategy_scores, resume_chain
+
+    async def _load_attack(self, attack_id: uuid.UUID) -> Attack | None:
+        """Load a single attack (resume path reuses the persisted chain turn)."""
+        async with AsyncSessionLocal() as session:
+            stmt = select(Attack).where(Attack.id == attack_id)
+            return (await session.execute(stmt)).scalars().first()
+
+    async def _verify_vulnerability_with_telemetry(
+        self,
+        experiment_id: uuid.UUID,
+        attack_id: uuid.UUID,
+        round_num: int,
+        eval_summary,
+    ) -> None:
+        """Run the independent verifier over a jailbreak finding and record the
+        evaluator-verifier agreement as ``AgentRun`` telemetry + structured log.
+        Best-effort: verifier failures must never abort a campaign."""
+        if not (self.verification_service and eval_summary.vulnerability_id):
+            return
+        try:
+            verified = await self.verification_service.verify_vulnerability(
+                eval_summary.vulnerability_id
+            )
+        except Exception:
+            verified = None
+        confirmed = bool(
+            verified
+            and verified.verified_status == "CONFIRMED_VULNERABILITY"
+        )
+        await self._record_agent_run(
+            experiment_id,
+            "verifier",
+            {
+                "round": round_num,
+                "attack_id": str(attack_id),
+                "vulnerability_id": str(eval_summary.vulnerability_id),
+                "verified_status": (
+                    verified.verified_status if verified else "ERROR"
+                ),
+                "agreement": confirmed,
+            },
+        )
+        logger.info(
+            "Evaluator-verifier agreement recorded",
+            extra={
+                "event_name": "verification.agreement",
+                "campaign_id": str(experiment_id),
+                "vulnerability_id": str(eval_summary.vulnerability_id),
+                "evaluator_verdict": "JAILBREAK",
+                "verifier_status": (
+                    verified.verified_status if verified else "ERROR"
+                ),
+                "agreement": confirmed,
+            },
+        )
+
+    async def _verify_attack_for_feedback(
+        self,
+        experiment_id: uuid.UUID,
+        attack_id: uuid.UUID,
+        round_num: int,
+    ) -> VerifierVerdict | None:
+        """Blindly verify a blocked attack for mutation feedback.
+
+        Best-effort: verifier failures must never abort a campaign.  The
+        verifier receives ONLY the attack prompt and the target's raw response
+        (independence preserved).  No ``Vulnerability`` row is created — blocked
+        attacks are not findings.
+        """
+        if not self.verification_service:
+            return None
+        try:
+            verdict = await self.verification_service.verify_attack(attack_id)
+        except Exception:
+            return None
+
+        await self._record_agent_run(
+            experiment_id,
+            "verifier",
+            {
+                "round": round_num,
+                "attack_id": str(attack_id),
+                "disposition": verdict.disposition.value,
+                "confidence": verdict.confidence,
+                "signal": verifier_signal_tag(verdict),
+                "feedback_used": True,
+            },
+        )
+        logger.info(
+            "Attack blind verification completed (feedback path)",
+            extra={
+                "event_name": "verification.attack_feedback_recorded",
+                "campaign_id": str(experiment_id),
+                "attack_id": str(attack_id),
+                "round": round_num,
+                "disposition": verdict.disposition.value,
+                "confidence": verdict.confidence,
+                "signal": verifier_signal_tag(verdict),
+            },
+        )
+        return verdict
 
     async def _load_campaign_spend(
         self, experiment_id: uuid.UUID

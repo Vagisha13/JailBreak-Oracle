@@ -1,4 +1,3 @@
-import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -6,13 +5,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.agents.defender import DefenderAgent
 from app.core.auth import get_current_user
 from app.core.config import settings
+from app.core.logging import get_logger
 from app.models.domain import User
 from app.schemas.report import DefenseReport, RedTeamReport
 from app.services.report import ReportService
 from app.targets.factory import TargetFactory
 from app.api.access import get_experiment_or_403
 
-logger = logging.getLogger(__name__)
+logger = get_logger("api.reports")
 
 router = APIRouter(prefix="/api/v1/reports", tags=["Reports & Analytics"])
 

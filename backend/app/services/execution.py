@@ -10,6 +10,10 @@ from app.services.budget import (
     TokenTracker,
     estimate_cost_usd,
 )
+from app.services.conversation import (
+    build_target_messages,
+    load_conversation_lineage,
+)
 from app.core.config import settings
 from app.targets.factory import TargetFactory
 from app.schemas.execution import ExecutionSummary
@@ -70,8 +74,15 @@ class ExecutionService:
             )
 
         try:
+            # Multi-turn: the target receives the full conversation (every prior
+            # turn's prompt + the target's response to it), ending with the
+            # current payload. For a root attack the lineage is a single turn,
+            # which is exactly the previous single-message behaviour.
+            lineage = await load_conversation_lineage(attack.id)
             target_response = await provider.execute(
-                prompt=attack.prompt_text, config=target_config
+                prompt=attack.prompt_text,
+                config=target_config,
+                messages=build_target_messages(lineage),
             )
         except BudgetExceededError:
             raise

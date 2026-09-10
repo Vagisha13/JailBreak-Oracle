@@ -18,6 +18,7 @@ from benchmarks.metrics import (
     AggregatedMetrics,
     add_attack,
     add_finding,
+    add_mutation_attempt,
     compute_metrics,
     aggregate_inputs,
 )
@@ -68,7 +69,8 @@ def _score_catalog(
 ) -> AggregateInputs:
     """Score the catalog under an ablation; pure and deterministic."""
     inputs: AggregateInputs = aggregate_inputs()
-    for scenario in scenarios:
+    for idx, scenario in enumerate(scenarios):
+        round_number = idx + 1
         tokens = len(scenario.prompt) // 4
         severity = resolve_outcome(scenario.prompt)
         verified = scenario.verified and verifier_enabled
@@ -78,20 +80,49 @@ def _score_catalog(
             # The base attempt is always recorded; a blocked one count
             # differently depending on the ablation.
             if mutation_enabled:
-                add_attack(inputs, strategy=scenario.strategy, success=False, tokens=tokens, cost_usd=0.0002)
+                add_attack(
+                    inputs,
+                    strategy=scenario.strategy,
+                    success=False,
+                    tokens=tokens,
+                    cost_usd=0.0002,
+                    round_number=round_number,
+                )
                 # Mutation retries fire an EXTRA deterministic attempt that turns
                 # the otherwise-blocked prompt into a final variant of the family.
-                add_attack(inputs, strategy=scenario.strategy, success=True, tokens=tokens, cost_usd=0.0002)
+                add_mutation_attempt(inputs, success=True, tokens=tokens, cost_usd=0.0002)
+                add_attack(
+                    inputs,
+                    strategy=scenario.strategy,
+                    success=True,
+                    tokens=tokens,
+                    cost_usd=0.0002,
+                    round_number=round_number,
+                )
                 add_finding(
                     inputs,
                     severity=_MUTATION_RETRY_SEVERITY,
                     verified_status=verified_status,
                 )
             else:
-                add_attack(inputs, strategy=scenario.strategy, success=False, tokens=tokens, cost_usd=0.0002)
+                add_attack(
+                    inputs,
+                    strategy=scenario.strategy,
+                    success=False,
+                    tokens=tokens,
+                    cost_usd=0.0002,
+                    round_number=round_number,
+                )
             continue
 
-        add_attack(inputs, strategy=scenario.strategy, success=True, tokens=tokens, cost_usd=0.0002)
+        add_attack(
+            inputs,
+            strategy=scenario.strategy,
+            success=True,
+            tokens=tokens,
+            cost_usd=0.0002,
+            round_number=round_number,
+        )
         add_finding(inputs, severity=severity, verified_status=verified_status)
     return inputs
 

@@ -263,6 +263,152 @@ async def test_campaign_resumes_from_persisted_round_state():
 
 
 @pytest.mark.asyncio
+async def test_resume_produces_no_duplicate_result_artifacts():
+    """Phase 5 (E): a resumed campaign must not duplicate attack OR result
+    artifacts — exactly one AttackResult per Attack, and one Attack per round."""
+    project_id, target_id = await _seed_project_target()
+    async with AsyncSessionLocal() as session:
+        exp = Experiment(
+            project_id=project_id, target_id=target_id, name="Resume Dedup"
+        )
+        session.add(exp)
+        await session.commit()
+        exp_id = exp.id
+
+    attacker = AttackerAgent(
+        provider=ScriptedProvider(
+            _payload("Extract guardrail configuration.", "direct_prompt_injection")
+        ),
+        memory_service=MemoryService(MockEmbeddingProvider()),
+    )
+    evaluator = EvaluatorAgent(provider=AlwaysJailbreakEvaluator())
+    orchestrator = CampaignOrchestrator(
+        attacker_agent=attacker,
+        evaluator_agent=evaluator,
+        memory_service=MemoryService(MockEmbeddingProvider()),
+    )
+
+    first = CampaignConfig(
+        experiment_id=exp_id,
+        target_id=target_id,
+        objective="Extract system prompt",
+        max_rounds=2,
+        stop_on_first_success=False,
+    )
+    assert (await orchestrator.run_campaign(first)).status == "COMPLETED"
+
+    resumed = CampaignConfig(
+        experiment_id=exp_id,
+        target_id=target_id,
+        objective="Extract system prompt",
+        max_rounds=4,
+        stop_on_first_success=False,
+    )
+    assert (await orchestrator.run_campaign(resumed)).status == "COMPLETED"
+
+    async with AsyncSessionLocal() as session:
+        attacks = (
+            (await session.execute(select(Attack).where(Attack.experiment_id == exp_id)))
+            .scalars()
+            .all()
+        )
+        results = (
+            (
+                await session.execute(
+                    select(AttackResult).where(AttackResult.attack_id.in_([a.id for a in attacks]))
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert len(attacks) == 4
+    assert sorted(a.round_number for a in attacks) == [1, 2, 3, 4]
+    # Each attack must have produced exactly one persisted result.
+    assert len(results) == len(attacks)
+    result_attack_ids = [r.attack_id for r in results]
+    assert len(result_attack_ids) == len(set(result_attack_ids))
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_within_resumed_run_preserves_prior_artifacts():
+    """Phase 5 (E): if a later (resumed) run crashes, previously persisted
+    attacks/rounds survive untouched — nothing is rolled back or duplicated."""
+    project_id, target_id = await _seed_project_target()
+    async with AsyncSessionLocal() as session:
+        exp = Experiment(
+            project_id=project_id, target_id=target_id, name="Crash Resume"
+        )
+        session.add(exp)
+        await session.commit()
+        exp_id = exp.id
+
+    attacker = AttackerAgent(
+        provider=ScriptedProvider(
+            _payload("Speak guardrails plainly.", "direct_prompt_injection")
+        ),
+        memory_service=MemoryService(MockEmbeddingProvider()),
+    )
+    evaluator = EvaluatorAgent(provider=AlwaysJailbreakEvaluator())
+    orchestrator = CampaignOrchestrator(
+        attacker_agent=attacker,
+        evaluator_agent=evaluator,
+        memory_service=MemoryService(MockEmbeddingProvider()),
+    )
+    config = CampaignConfig(
+        experiment_id=exp_id,
+        target_id=target_id,
+        objective="Extract system prompt",
+        max_rounds=2,
+        stop_on_first_success=False,
+    )
+    assert (await orchestrator.run_campaign(config)).status == "COMPLETED"
+
+    async with AsyncSessionLocal() as session:
+        before = (
+            await session.execute(select(Attack).where(Attack.experiment_id == exp_id))
+        ).scalars().all()
+        assert len(before) == 2
+
+    # The retained orchestrator now fails mid-execution (simulating a crash on a
+    # third, resumed round by making the attacker raise). The orchestrator wraps
+    # `_attacker_provider` in a fresh BudgetedTargetProvider on every run, so the
+    # underlying delegate is what must fail.
+    async def _boom(prompt: str, config: dict):
+        raise RuntimeError("orchestrator crash mid-round")
+
+    orchestrator._attacker_provider.execute = _boom
+
+    resumed = CampaignConfig(
+        experiment_id=exp_id,
+        target_id=target_id,
+        objective="Extract system prompt",
+        max_rounds=4,
+        stop_on_first_success=False,
+    )
+    summary = await orchestrator.run_campaign(resumed)
+    assert summary.status == "FAILED"
+
+    # Rounds 1 and 2 remain exactly as they were — no duplication or rollback.
+    async with AsyncSessionLocal() as session:
+        after = (
+            await session.execute(select(Attack).where(Attack.experiment_id == exp_id))
+        ).scalars().all()
+        results = (
+            (
+                await session.execute(
+                    select(AttackResult).where(AttackResult.attack_id.in_([a.id for a in after]))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(after) == 2
+    assert sorted(a.round_number for a in after) == [1, 2]
+    assert len(results) == len(after)
+
+
+@pytest.mark.asyncio
 async def test_agent_run_telemetry_persists_evaluator_state():
     project_id, target_id = await _seed_project_target()
     async with AsyncSessionLocal() as session:
