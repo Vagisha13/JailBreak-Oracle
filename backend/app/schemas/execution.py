@@ -19,3 +19,10 @@ class ExecutionSummary(BaseModel):
     latency_ms: float
     token_usage: Dict[str, Any]
     error: Optional[str] = None
+    error_type: Optional[str] = Field(
+        default=None,
+        description="Stable failure classification (auth_error, timeout, ...)",
+    )
+    status_code: Optional[int] = Field(
+        default=None, description="HTTP status when the target is HTTP-backed"
+    )

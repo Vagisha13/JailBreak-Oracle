@@ -6,12 +6,19 @@ Supports two backends:
   * Redis fixed-window counter (used when ``REDIS_URL`` is configured) so that
     limits are shared across multiple application instances in production.
 
+Redis is used only while the shared client (app.core.redis_client) reports it
+healthy. Any live failure trips the shared circuit breaker and the request is
+served from the in-memory backend — a Redis outage slows us down but never
+returns 500s. Clients may briefly exceed shared limits during a degradation;
+counter-side slack is the price of fail-open availability.
+
 Client identity trusts ``X-Forwarded-For`` ONLY for peers listed in
 ``settings.TRUSTED_PROXIES`` (E-24). Without a configured proxy allowlist the
 raw socket peer is used and spoofed forwarded headers are ignored.
 
 Health checks and other cheap/no-risk endpoints are never rate-limited.
 """
+import asyncio
 import ipaddress
 import json
 import time
@@ -21,11 +28,17 @@ from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
+from app.core.redis_client import (
+    circuit_open,
+    forget_cached_client,
+    get_redis_client,
+    is_redis_configured,
+)
 
 # Public paths that are intentionally exempt from rate limiting.
 _RATE_LIMIT_EXEMPT_PREFIXES = ("/health", "/docs", "/redoc", "/openapi.json")
 
-_active_limiter: dict = {"instance": None}
+_active_limiter: dict = {"memory": None, "middleware": None}
 
 
 class InMemoryRateLimiter:
@@ -51,24 +64,40 @@ class InMemoryRateLimiter:
 
 
 class RedisRateLimiter:
-    """Fixed-window Redis-backed limiter shared across instances."""
+    """Fixed-window Redis-backed limiter shared across instances.
+
+    ``check`` returns ``None`` instead of raising when Redis fails mid-request;
+    the middleware treats that as "degrade this request to in-memory".
+    """
 
     def __init__(self, redis_client) -> None:
         self.redis = redis_client
         self._prefix = "oracle:ratelimit:"
 
-    async def check(self, key: str, limit: int, window: int) -> Tuple[bool, Optional[int]]:
+    async def check(self, key: str, limit: int, window: int) -> Optional[Tuple[bool, Optional[int]]]:
         redis_key = f"{self._prefix}{key}"
-        count = await self.redis.incr(redis_key)
-        if count == 1:
-            await self.redis.expire(redis_key, window)
-        if count > limit:
-            ttl = await self.redis.ttl(redis_key)
-            return False, max(1, int(ttl) if ttl and ttl > 0 else 1)
-        return True, None
+        try:
+            count = await self.redis.incr(redis_key)
+            if count == 1:
+                await self.redis.expire(redis_key, window)
+            if count > limit:
+                ttl = await self.redis.ttl(redis_key)
+                return False, max(1, int(ttl) if ttl and ttl > 0 else 1)
+            return True, None
+        except Exception as exc:  # redis.exceptions.RedisError, ConnectionError, timeout...
+            from app.core.redis_client import trip_circuit
 
-    def reset(self) -> None:
-        pass
+            trip_circuit(type(exc).__name__)
+            return None
+
+    async def reset_global(self) -> None:
+        """Drop every key this limiter owns (shared counters across instances)."""
+        try:
+            keys = [k async for k in self.redis.scan_iter(match=self._prefix + "*")]
+            if keys:
+                await self.redis.delete(*keys)
+        except Exception:
+            pass
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -76,27 +105,17 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
     def __init__(self, app) -> None:
         super().__init__(app)
-        self._limiter: Optional[object] = None
-        self._limiter_attempted = False
+        self._redis_limiter: Optional[RedisRateLimiter] = None
+        self._memory = InMemoryRateLimiter()
+        _active_limiter["memory"] = self._memory
+        _active_limiter["middleware"] = self
 
     def _get_limiter(self):
-        if self._limiter is None and not self._limiter_attempted:
-            limiter = InMemoryRateLimiter()
-            if settings.REDIS_URL:
-                try:
-                    import redis.asyncio as aioredis  # type: ignore
-
-                    client = aioredis.from_url(
-                        settings.REDIS_URL, socket_connect_timeout=1
-                    )
-                    limiter = RedisRateLimiter(client)
-                except Exception:
-                    # Fail open: fall back to in-memory limiting if Redis is down.
-                    limiter = InMemoryRateLimiter()
-            self._limiter = limiter
-            self._limiter_attempted = True
-            _active_limiter["instance"] = limiter
-        return self._limiter
+        if is_redis_configured():
+            if self._redis_limiter is None:
+                self._redis_limiter = RedisRateLimiter(get_redis_client())
+            return self._redis_limiter
+        return self._memory
 
     @staticmethod
     def _classify(request: Request) -> Optional[Tuple[str, int]]:
@@ -167,10 +186,14 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         limiter = self._get_limiter()
         key = f"{bucket}:{self._client_ip(request)}"
-        allowed, retry_after = await limiter.check(
-            key, limit, settings.RATE_LIMIT_WINDOW_SECONDS
-        )
+        checked = await limiter.check(key, limit, settings.RATE_LIMIT_WINDOW_SECONDS)
 
+        if checked is None and limiter is not self._memory:
+            # Redis failed mid-flight (circuit tripped). Fail open to memory for
+            # this request rather than 500ing the API.
+            checked = await self._memory.check(key, limit, settings.RATE_LIMIT_WINDOW_SECONDS)
+
+        allowed, retry_after = checked
         if not allowed:
             retry_after = retry_after or settings.RATE_LIMIT_WINDOW_SECONDS
             body = json.dumps(
@@ -187,15 +210,98 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 headers={"Retry-After": str(retry_after)},
             )
 
-        if hasattr(limiter, "reset"):
-            request.app.state.rate_limiter = limiter
+        return await call_next(request)
 
-        response = await call_next(request)
-        return response
+    async def reset(self) -> None:
+        """Reset counters on both backends (used by tests)."""
+        self._memory.reset()
+        if self._redis_limiter is not None:
+            await self._redis_limiter.reset_global()
+            self._redis_limiter = None
+
+
+def _flush_redis_rate_limit_keys() -> None:
+    """Synchronously delete every rate-limit counter key owned by Redis.
+
+    Uses a short-lived sync client so the async limiter's lifecycle is
+    untouched. Safe to call from test helpers and admin utilities: when Redis
+    is unreachable the in-memory backend still governs the current request and
+    a later probe retrips the shared circuit. Best-effort by design.
+    """
+    url = settings.REDIS_URL
+    if not url:
+        return
+    try:
+        import redis as sync_redis  # sync driver ships with redis-py
+
+        client = sync_redis.Redis.from_url(
+            url,
+            socket_connect_timeout=1.0,
+            socket_timeout=2.0,
+        )
+        try:
+            cursor = 0
+            while True:
+                cursor, keys = client.scan(cursor, match="oracle:ratelimit:*", count=200)
+                if keys:
+                    client.delete(*keys)
+                if cursor == 0:
+                    break
+        finally:
+            client.close()
+    except Exception:  # pragma: no cover - connectivity is best-effort here
+        pass
+
+
+async def _aclose_client(client) -> None:
+    """Best-effort ``aclose`` so the coroutine runs under an active loop."""
+    try:
+        await client.aclose()
+    except Exception:  # pragma: no cover - loop may already be tearing down
+        pass
+
+
+def _dispose_redis_limiter() -> None:
+    """Drop the cached Redis limiter, closing its async client first.
+
+    redis.asyncio pools bind their connections to a specific event loop; the
+    test suite runs each async case in its own loop, so a stale client must be
+    closed (never garbage-collected) whenever limiter state is reset. Closing
+    is scheduled on the currently running loop when one exists.
+    """
+    middleware = _active_limiter.get("middleware")
+    if middleware is None:
+        return
+    limiter = getattr(middleware, "_redis_limiter", None)
+    if limiter is None:
+        return
+    middleware._redis_limiter = None
+    client = limiter.redis
+    if client is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None:
+        loop.create_task(_aclose_client(client))
 
 
 def reset_rate_limiter() -> None:
-    """Reset the active limiter (used by tests)."""
-    instance = _active_limiter.get("instance")
-    if instance is not None and hasattr(instance, "reset"):
-        instance.reset()
+    """Reset rate-limit state across every backend (tests/admin utilities).
+
+    Clears the in-memory counters, drops the middleware's cached Redis limiter
+    (closing its pooled connections), deletes the shared Redis counters, and
+    forgives the shared failure circuit so the next request re-probes Redis.
+    """
+    memory = _active_limiter.get("memory")
+    if memory is not None and hasattr(memory, "reset"):
+        memory.reset()
+    _dispose_redis_limiter()
+    _flush_redis_rate_limit_keys()
+    forget_cached_client()
+
+
+def circuit_open_state() -> bool:
+    """Expose the shared circuit state for diagnostics."""
+    return circuit_open()

@@ -123,6 +123,7 @@ class MockTargetProvider(TargetProvider):
                 response_text="",
                 latency_ms=latency_ms,
                 error="Simulated provider connection error.",
+                error_type="connection_error",
             )
         elif evolved_in_conversation and conversation_well_formed:
             # Evolved conversation -> the target complies. Deterministic and

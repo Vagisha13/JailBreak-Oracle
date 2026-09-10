@@ -7,6 +7,7 @@ from app.targets.mock import (
     MockVerifierProvider,
 )
 from app.targets.litellm import LiteLLMTargetProvider
+from app.targets.custom_http import CustomHTTPTargetProvider
 
 
 class TargetFactory:
@@ -36,6 +37,9 @@ class TargetFactory:
             if role == "defender":
                 return MockDefenderProvider()
             return MockTargetProvider()
+
+        elif provider_lower in ("custom_http", "http"):
+            return CustomHTTPTargetProvider()
 
         elif provider_lower in [
             "litellm",

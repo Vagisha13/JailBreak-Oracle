@@ -56,6 +56,33 @@ class ReportService:
             target = (await session.execute(target_stmt)).scalars().first()
             target_name = target.name if target else "Unknown Target"
 
+            # Target-agent snapshot: secret-free and immutable from start time.
+            if exp.target_snapshot_json and isinstance(exp.target_snapshot_json, dict):
+                target_snapshot = dict(exp.target_snapshot_json)
+                target_agent = {
+                    "id": target_snapshot.get("id") or str(exp.target_id),
+                    "name": target_snapshot.get("name") or target_name,
+                    "provider_type": target_snapshot.get("provider_type"),
+                    "is_enabled": target_snapshot.get("is_enabled"),
+                    "endpoint_url": target_snapshot.get("endpoint_url"),
+                    "model": target_snapshot.get("model"),
+                    "api_base": target_snapshot.get("api_base"),
+                }
+            else:
+                target_agent = {
+                    "id": str(exp.target_id),
+                    "name": target_name,
+                    "provider_type": target.provider_type if target else None,
+                    "is_enabled": target.is_enabled if target else None,
+                    "endpoint_url": target.endpoint_url if target else None,
+                    "model": (target.config_json or {}).get("model")
+                    if target
+                    else None,
+                    "api_base": (target.config_json or {}).get("api_base")
+                    if target
+                    else None,
+                }
+
             # 2. Fetch Attacks
             attacks_stmt = select(Attack).where(Attack.experiment_id == experiment_id)
             attacks = (await session.execute(attacks_stmt)).scalars().all()
@@ -143,6 +170,7 @@ class ReportService:
                 experiment_name=exp.name,
                 target_id=exp.target_id,
                 target_name=target_name,
+                target_agent=target_agent,
                 generated_at=datetime.now(timezone.utc),
                 overall_risk_score=risk_score,
                 total_attacks_executed=total_attacks,

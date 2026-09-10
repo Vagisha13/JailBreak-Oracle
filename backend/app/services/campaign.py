@@ -91,8 +91,14 @@ class CampaignOrchestrator:
         name: str,
         attack_budget: int = 10,
         exploration_ratio: float = 0.3,
+        target_snapshot: dict | None = None,
     ) -> uuid.UUID:
-        """Create a new Experiment record and return its ID."""
+        """Create a new Experiment record and return its ID.
+
+        ``target_snapshot`` is the secret-free snapshot of the target agent at
+        start time; it is persisted so status/reports stay deterministic even
+        if the target is later edited or deleted.
+        """
         async with AsyncSessionLocal() as session:
             experiment = Experiment(
                 project_id=project_id,
@@ -101,6 +107,7 @@ class CampaignOrchestrator:
                 status="PENDING",
                 attack_budget=attack_budget,
                 exploration_ratio=exploration_ratio,
+                target_snapshot_json=target_snapshot or None,
                 # Persist the effective per-campaign cost cap so the ledger and
                 # status surface report it; NULL falls back to the global.
                 max_cost_usd=settings.MAX_CAMPAIGN_COST,
@@ -109,6 +116,44 @@ class CampaignOrchestrator:
             await session.commit()
             await session.refresh(experiment)
             return experiment.id
+
+    async def record_campaign_failure(
+        self, experiment_id: uuid.UUID, reason: str = "execution_error"
+    ) -> None:
+        """Mark a campaign FAILED without running it (e.g. queue unavailable).
+
+        Guaranteed-visible failure semantics (S3): once a campaign is terminal
+        the worker lease is unclaimable, so a FAILED row can never be silently
+        started by a later worker.
+        """
+        async with AsyncSessionLocal() as session:
+            stmt = select(Experiment).where(Experiment.id == experiment_id)
+            experiment = (await session.execute(stmt)).scalars().first()
+            if experiment is None:
+                return
+            experiment.status = "FAILED"
+            experiment.finished_at = datetime.now(timezone.utc)
+            experiment.heartbeat_at = datetime.now(timezone.utc)
+            session.add(
+                AgentRun(
+                    experiment_id=experiment_id,
+                    agent_type="campaign",
+                    state_json={
+                        "status": "FAILED",
+                        "reason": reason,
+                        "error_type": "queue_unavailable"
+                        if reason == "queue_unavailable"
+                        else "manual_failure",
+                        "message": (
+                            "Campaign worker queue (Redis) is unavailable; "
+                            "campaign was not started."
+                            if reason == "queue_unavailable"
+                            else reason
+                        ),
+                    },
+                )
+            )
+            await session.commit()
 
     async def run_attack_loop(self, experiment_id: uuid.UUID):
         """Execute the full adaptive attack loop for an experiment.

@@ -55,6 +55,12 @@ async def setup_test_database():
     # explicitly and reset limiter state between checks.
     original_enabled = settings.RATE_LIMIT_ENABLED
     settings.RATE_LIMIT_ENABLED = False
+
+    # The suite must never depend on (or churn connections against) a
+    # developer-local Redis; the shared limiter and queue fall back to their
+    # in-memory/in-process paths deterministically instead.
+    original_redis_url = settings.REDIS_URL
+    settings.REDIS_URL = None
     reset_rate_limiter()
 
     async with engine.begin() as conn:
@@ -65,6 +71,7 @@ async def setup_test_database():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
 
+    settings.REDIS_URL = original_redis_url
     settings.RATE_LIMIT_ENABLED = original_enabled
 
     if _test_db_dir is not None:

@@ -1,13 +1,18 @@
 import uuid
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.core.config import settings
 
 
 class CampaignStartRequest(BaseModel):
-    """Request schema from the frontend to start a campaign."""
+    """Request schema from the frontend to start a campaign.
+
+    ``target_agent_id`` is the modern name for the campaign's target; ``target_id``
+    is kept as a backward-compatible alias and both resolve to the same ``Target``
+    row. Exactly one of the two must be provided.
+    """
 
     name: str = Field(
         "Unnamed Campaign",
@@ -16,7 +21,12 @@ class CampaignStartRequest(BaseModel):
         description="Campaign display name",
     )
     project_id: uuid.UUID = Field(..., description="ID of the project")
-    target_id: uuid.UUID = Field(..., description="ID of the target model")
+    target_id: Optional[uuid.UUID] = Field(
+        default=None, description="ID of the target agent (legacy alias)"
+    )
+    target_agent_id: Optional[uuid.UUID] = Field(
+        default=None, description="ID of the target agent to attack"
+    )
     attack_budget: int = Field(
         10,
         ge=1,
@@ -26,6 +36,18 @@ class CampaignStartRequest(BaseModel):
     exploration_ratio: float = Field(
         0.3, ge=0.0, le=1.0, description="0=exploit, 1=explore"
     )
+
+    @model_validator(mode="after")
+    def _resolve_target(self) -> "CampaignStartRequest":
+        provided = [t for t in (self.target_id, self.target_agent_id) if t is not None]
+        if len(provided) > 1:
+            raise ValueError(
+                "Provide either target_id or target_agent_id, not both."
+            )
+        resolved = provided[0] if provided else None
+        self.target_id = resolved
+        self.target_agent_id = resolved
+        return self
 
 
 class CampaignResponse(BaseModel):

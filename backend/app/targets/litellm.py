@@ -36,7 +36,7 @@ def _is_transient(exc: Exception) -> bool:
 
 
 def _normalize_error(exc: Exception) -> str:
-    """Map provider exceptions to clean, log-safe messages (no credentials)."""
+    """Map provider exceptions to a clean, log-safe message (no credentials leak)."""
     if isinstance(exc, litellm.AuthenticationError):
         return "LLM provider authentication failed. Check provider API keys."
     if isinstance(exc, litellm.RateLimitError):
@@ -54,6 +54,26 @@ def _normalize_error(exc: Exception) -> str:
     if isinstance(status, int) and 400 <= status < 500:
         return f"LLM provider request rejected (HTTP {status})."
     return "LLM provider execution error."
+
+
+def _classify_error(exc: Exception) -> str:
+    """Stable machine-readable error classification (mirrors ``_normalize_error``)."""
+    if isinstance(exc, litellm.AuthenticationError):
+        return "auth_error"
+    if isinstance(exc, litellm.RateLimitError):
+        return "rate_limit"
+    if isinstance(exc, litellm.Timeout):
+        return "timeout"
+    if isinstance(exc, litellm.ContextWindowExceededError):
+        return "context_window"
+    if isinstance(exc, litellm.BadRequestError):
+        return "bad_request"
+    if isinstance(exc, litellm.NotFoundError):
+        return "not_found"
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and 400 <= status < 500:
+        return "http_error"
+    return "provider_error"
 
 
 class LiteLLMTargetProvider(TargetProvider):
@@ -92,6 +112,8 @@ class LiteLLMTargetProvider(TargetProvider):
         model = config.get("model", self.default_model)
         temperature = config.get("temperature", 0.7)
         api_key = config.get("api_key")
+        # OpenAI-compatible base URL (custom gateways, self-hosted proxies, ...).
+        api_base = config.get("api_base")
 
         # Multi-turn conversations pass the full OpenAI-style message list; a
         # single-turn call falls back to the original ``[{user: prompt}]`` shape.
@@ -106,6 +128,8 @@ class LiteLLMTargetProvider(TargetProvider):
 
         if api_key:
             kwargs["api_key"] = api_key
+        if api_base:
+            kwargs["api_base"] = api_base
 
         last_error: Optional[Exception] = None
 
@@ -169,8 +193,12 @@ class LiteLLMTargetProvider(TargetProvider):
         latency = (time.perf_counter() - start_time) * 1000.0
         latency = max(latency, 0.001)
 
+        message = _normalize_error(last_error) if last_error else "LLM provider error."
+        error_type = _classify_error(last_error) if last_error else "provider_error"
         return TargetResponse(
             response_text="",
             latency_ms=latency,
-            error=_normalize_error(last_error) if last_error else "LLM provider error.",
+            error=message,
+            error_type=error_type,
+            status_code=getattr(last_error, "status_code", None) if last_error else None,
         )

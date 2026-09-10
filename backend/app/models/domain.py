@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
-from sqlalchemy import String, Text, Float, Integer, ForeignKey, DateTime, JSON
+from sqlalchemy import String, Text, Float, Integer, ForeignKey, DateTime, JSON, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 from pgvector.sqlalchemy import Vector
@@ -57,6 +57,9 @@ class Target(Base, BaseMixin):
     provider_type: Mapped[str] = mapped_column(String(50), nullable=False)
     endpoint_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     config_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Target agents can be soft-disabled so an owner can take a target out of
+    # service without destroying its history/configuration.
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )
@@ -104,6 +107,10 @@ class Experiment(Base, BaseMixin):
     lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Immutable snapshot of the target agent config the campaign started with
+    # (name, provider_type, model, endpoint, enabled-state). Keeps reports and
+    # status deterministic even after the target is later edited or deleted.
+    target_snapshot_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     project: Mapped["Project"] = relationship("Project", back_populates="experiments")
     target: Mapped["Target"] = relationship("Target", back_populates="experiments")
@@ -163,6 +170,10 @@ class AttackResult(Base, BaseMixin):
     latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
     token_usage_json: Mapped[dict] = mapped_column(JSON, default=dict)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Controlled, queryable failure attribution (E-27): classify the failure so
+    # "is this target frequently timing out?" is a WHERE clause, not log spelunking.
+    error_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    status_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )

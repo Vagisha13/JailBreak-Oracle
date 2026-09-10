@@ -17,6 +17,7 @@ from app.services.conversation import (
 from app.core.config import settings
 from app.targets.factory import TargetFactory
 from app.schemas.execution import ExecutionSummary
+from app.services.targets import build_provider_config
 from app.core.logging import get_logger
 
 logger = get_logger("execution")
@@ -54,7 +55,8 @@ class ExecutionService:
                 raise ValueError(f"Target with ID {target_id} not found.")
 
             target_provider_type = target.provider_type
-            target_config = target.config_json or {}
+            target_config = build_provider_config(target)
+            target_config["provider_type"] = target_provider_type
             experiment_id = self.experiment_id or attack.experiment_id
 
         # 3. Instantiate Target Provider & Execute
@@ -102,6 +104,7 @@ class ExecutionService:
                 latency_ms=0.0,
                 token_usage=token_json,
                 error_message=f"Unhandled Provider Exception: {str(exc)}",
+                error_type="unhandled_error",
             )
 
         # 4. Extract Telemetry & Persist
@@ -124,6 +127,8 @@ class ExecutionService:
             latency_ms=target_response.latency_ms,
             token_usage=token_json,
             error_message=target_response.error,
+            error_type=target_response.error_type,
+            status_code=target_response.status_code,
         )
 
         if target_response.error:
@@ -157,6 +162,8 @@ class ExecutionService:
         latency_ms: float,
         token_usage: dict,
         error_message: str | None,
+        error_type: str | None = None,
+        status_code: int | None = None,
     ) -> ExecutionSummary:
         async with AsyncSessionLocal() as session:
             result_record = AttackResult(
@@ -165,6 +172,8 @@ class ExecutionService:
                 latency_ms=latency_ms,
                 token_usage_json=token_usage,
                 error_message=error_message,
+                error_type=error_type,
+                status_code=status_code,
             )
             session.add(result_record)
             await session.commit()
@@ -177,4 +186,6 @@ class ExecutionService:
                 latency_ms=result_record.latency_ms,
                 token_usage=result_record.token_usage_json,
                 error=result_record.error_message,
+                error_type=result_record.error_type,
+                status_code=result_record.status_code,
             )

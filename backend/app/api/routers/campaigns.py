@@ -26,6 +26,7 @@ from app.schemas.campaign import CampaignStartRequest, CampaignResponse
 from app.services.factory import build_campaign_orchestrator
 from app.services.campaign import CampaignOrchestrator
 from app.services.queue import enqueue_campaign
+from app.services.targets import snapshot_target
 from app.api.access import get_target_or_403, get_project_or_403, get_experiment_or_403
 
 logger = get_logger("api.campaigns")
@@ -129,6 +130,7 @@ async def setup_demo_environment(current_user: User = Depends(get_current_user))
         return {
             "project_id": str(project.id),
             "target_id": str(target.id),
+            "target_agent_id": str(target.id),
             "message": "Demo environment ready!",
         }
 
@@ -284,11 +286,30 @@ async def get_campaign_status(
         "per_model": per_model,
     }
 
+    # Target-agent block: prefer the immutable snapshot persisted at start so
+    # the dashboard never changes shape when the target is later edited.
+    target_agent = None
+    if experiment.target_snapshot_json:
+        snapshot = dict(experiment.target_snapshot_json)
+        target_agent = {
+            "id": snapshot.get("id") or str(experiment.target_id),
+            "name": snapshot.get("name"),
+            "provider_type": snapshot.get("provider_type"),
+            "is_enabled": snapshot.get("is_enabled"),
+            "endpoint_url": snapshot.get("endpoint_url"),
+            "model": snapshot.get("model"),
+            "api_base": snapshot.get("api_base"),
+        }
+    else:
+        target = await get_target_or_403(experiment.target_id, current_user.id)
+        target_agent = snapshot_target(target)
+
     return {
         "experiment_id": str(experiment.id),
         "name": experiment.name,
         "status": experiment.status,
         "attack_budget": experiment.attack_budget,
+        "target_agent": target_agent,
         "created_at": experiment.created_at.isoformat() if experiment.created_at else None,
         "finished_at": experiment.finished_at.isoformat() if experiment.finished_at else None,
         "current_round": current_round,
@@ -347,6 +368,9 @@ async def get_campaign_attacks(
                     "created_at": attack.created_at.isoformat() if attack.created_at else None,
                     "target_response": attack_result.target_response if attack_result else None,
                     "latency_ms": attack_result.latency_ms if attack_result else None,
+                    "error_message": attack_result.error_message if attack_result else None,
+                    "error_type": attack_result.error_type if attack_result else None,
+                    "status_code": attack_result.status_code if attack_result else None,
                     "is_jailbreak": vuln is not None,
                     "severity": vuln.severity if vuln else None,
                     "verified_status": vuln.verified_status if vuln else None,
@@ -416,7 +440,29 @@ async def start_campaign(
 ):
     # Ownership: campaign resources must belong to the authenticated user.
     await get_project_or_403(request.project_id, current_user.id)
-    await get_target_or_403(request.target_id, current_user.id)
+    if request.target_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide a target (target_agent_id or target_id).",
+        )
+    target = await get_target_or_403(request.target_id, current_user.id)
+
+    if not target.is_enabled:
+        raise HTTPException(
+            status_code=409,
+            detail="This target agent is disabled. Enable it before starting a campaign.",
+        )
+    if (
+        target.provider_type.lower() not in settings.target_type_list
+        and target.provider_type.lower() != "mock"
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Target provider type '{target.provider_type}' is not enabled. "
+                f"Allowed: {', '.join(settings.target_type_list)}"
+            ),
+        )
 
     try:
         experiment_id = await orchestrator.initialize_experiment(
@@ -425,6 +471,7 @@ async def start_campaign(
             name=request.name,
             attack_budget=request.attack_budget,
             exploration_ratio=request.exploration_ratio,
+            target_snapshot=snapshot_target(target),
         )
     except Exception as exc:
         logger.error(
@@ -445,6 +492,7 @@ async def start_campaign(
             "user_id": str(current_user.id),
             "campaign_id": str(experiment_id),
             "attack_budget": request.attack_budget,
+            "target_agent_id": str(request.target_id),
         },
     )
 
@@ -453,6 +501,27 @@ async def start_campaign(
 
     if enqueued:
         message = "Campaign queued for execution."
+    elif settings.APP_ENV == "production":
+        # S3 requirement: in production a campaign must NOT silently run inside
+        # the API process. It is either on the Redis worker queue or visibly
+        # failed — never "started" in-memory where a crash would drop it.
+        await orchestrator.record_campaign_failure(
+            experiment_id, reason="queue_unavailable"
+        )
+        logger.error(
+            "Campaign could not be queued in production; marking failed",
+            extra={
+                "event_name": "campaign.queue_unavailable",
+                "campaign_id": str(experiment_id),
+            },
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Campaign worker queue (Redis) is unavailable. The campaign was "
+                "not started; enable REDIS_URL to run campaigns in production."
+            ),
+        )
     else:
         background_tasks.add_task(orchestrator.run_attack_loop, experiment_id)
         message = "Campaign started in process (Redis worker not configured)."

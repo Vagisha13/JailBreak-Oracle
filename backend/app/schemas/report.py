@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 
 
 class SeverityBreakdown(BaseModel):
@@ -32,6 +32,9 @@ class RedTeamReport(BaseModel):
     experiment_name: str
     target_id: uuid.UUID
     target_name: str
+    # Secret-free snapshot of the target agent this campaign attacked (from the
+    # Experiment row) so the report stays accurate even after the target changed.
+    target_agent: Optional[dict] = None
     generated_at: datetime
     overall_risk_score: float = Field(
         ..., description="Calculated risk score from 0.0 (Safe) to 100.0 (Critical)"

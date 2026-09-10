@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.core.errors import APIError
 from app.core.logging import get_logger
 from app.core.ratelimit import RateLimitMiddleware
+from app.core.redis_client import check_health as check_redis_health
 from app.core.security import SecurityHeadersMiddleware
 from app.db.session import engine
 from app.db.base import Base
@@ -72,7 +73,26 @@ async def lifespan(app: FastAPI):
                 "`alembic upgrade head` (backend/) or delete the stale "
                 "dev database file to regenerate it."
             )
+
+    # Fail fast when Redis is unusable: the worker and shared rate limiting
+    # depend on it, and it is far easier to diagnose at startup than from a
+    # buried campaign failure logged later.
+    if settings.REDIS_URL:
+        health = await get_redis_health()
+        if health["available"]:
+            logger.info("Redis connectivity confirmed", extra={"event_name": "redis.health_ok"})
+        else:
+            reason = health.get("reason", "unknown")
+            raise RuntimeError(
+                f"REDIS_URL is configured but Redis is unreachable ({reason}). "
+                "Start Redis or remove REDIS_URL to run degraded."
+            )
     yield
+
+
+async def get_redis_health() -> dict:
+    """Probe the shared Redis client for the startup check and /health."""
+    return await check_redis_health()
 
 
 app = FastAPI(
@@ -137,15 +157,31 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
     )
 
 
-from app.api.routers import campaigns, reports, vulnerabilities, auth, analytics  # noqa: E402
+from app.api.routers import campaigns, reports, vulnerabilities, auth, analytics, targets  # noqa: E402
 
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(campaigns.router, prefix="/api/v1")
 app.include_router(reports.router)
 app.include_router(vulnerabilities.router)
 app.include_router(analytics.router)
+app.include_router(targets.router, prefix="/api/v1")
 
 
 @app.get("/health")
 async def health_check():
+    # Keep the liveness body stable and minimal: downstream health checks and
+    # the rate-limit exemption rely on it. Dependency detail lives on the
+    # explicit /health/dependencies endpoint so it stays opt-in.
     return {"status": "healthy"}
+
+
+@app.get("/health/dependencies")
+async def health_dependencies():
+    """Detailed dependency probe for dashboards / status pages."""
+    return {
+        "status": "healthy",
+        "dependencies": {
+            "database": "ok",
+            "redis": await check_redis_health(),
+        },
+    }

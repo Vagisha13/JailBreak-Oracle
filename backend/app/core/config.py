@@ -93,6 +93,27 @@ class Settings(BaseSettings):
 
     # ── Redis (job queue + distributed rate limiting) ─────────
     REDIS_URL: Optional[str] = None
+    # After a Redis failure, back off this long before probing again. Keeps a
+    # dead Redis from slowing every request while it is down; during the backoff
+    # the app runs degraded (in-memory limiting / in-process queue).
+    REDIS_RETRY_SECONDS: float = 30.0
+    REDIS_CONNECT_TIMEOUT_SECONDS: float = 2.0
+
+    # ── Target Agents (external LLM endpoints) ─────────────────
+    # Types accepted by TargetProviderFactory.
+    TARGET_TYPES: str = "litellm,custom_http"
+    # Time budget (seconds) for one TARGET_* provider call (custom_http / litellm).
+    TARGET_CALL_TIMEOUT_SECONDS: float = 60.0
+    # Maximum size of a custom HTTP target response body we are willing to read.
+    MAX_TARGET_RESPONSE_BYTES: int = 512_000
+    # Comma-separated private hosts the custom_http provider may call (SSRF
+    # guard default-deny). Typically empty in production. Local development and
+    # the test suite allow 127.0.0.1 / localhost so a locally-run dummy target
+    # can be exercised end-to-end.
+    SSRF_ALLOW_PRIVATE_HOSTS: str = ""
+    # Comma-separated IPs (or hostnames) always allowed even when private
+    # (e.g. a legacy internal LLM gateway on your own VPC).
+    SSRF_DENY_ANY_PRIVATE: bool = True
 
     # ── LLM Provider Resilience ───────────────────────────────
     LLM_TIMEOUT_SECONDS: float = 60.0
@@ -124,6 +145,14 @@ class Settings(BaseSettings):
     @property
     def trusted_proxy_list(self) -> list[str]:
         return [p.strip() for p in self.TRUSTED_PROXIES.split(",") if p.strip()]
+
+    @property
+    def target_type_list(self) -> list[str]:
+        return [t.strip() for t in self.TARGET_TYPES.split(",") if t.strip()]
+
+    @property
+    def ssrf_allow_private_hosts(self) -> list[str]:
+        return [h.strip().lower() for h in self.SSRF_ALLOW_PRIVATE_HOSTS.split(",") if h.strip()]
 
     @property
     def jwt_secret(self) -> str:
