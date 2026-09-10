@@ -27,6 +27,13 @@ from app.services.execution import ExecutionService
 from app.services.evaluation import EvaluationService
 from app.services.verification import VerificationService
 from app.services.memory import MemoryService
+from app.services.lease import (
+    ACQUIRED,
+    RENEWED,
+    acquire,
+    release,
+    renew,
+)
 from app.strategies.registry import get_strategy, list_strategies
 from app.schemas.feedback import AttackFeedback
 from app.services.mutation import MutationEngine
@@ -71,6 +78,10 @@ class CampaignOrchestrator:
         )
         self.mutation_engine = MutationEngine(attacker_agent)
 
+        # Per-job lease token (E-26): set for the duration of a single
+        # ``run_attack_loop`` acquisition and used to renew/release the lease.
+        self._lease_owner: uuid.UUID | None = None
+
     async def initialize_experiment(
         self,
         project_id: uuid.UUID,
@@ -98,13 +109,55 @@ class CampaignOrchestrator:
             return experiment.id
 
     async def run_attack_loop(self, experiment_id: uuid.UUID):
-        """Execute the full adaptive attack loop for an experiment."""
-        config = await self._build_config(experiment_id)
-        if config is None:
-            return
+        """Execute the full adaptive attack loop for an experiment.
 
-        summary = await self.run_campaign(config)
-        return summary
+        Multi-worker safety (E-26): the campaign is first atomically claimed via
+        the DB lease. Only the worker whose ``PENDING -> RUNNING`` CAS wins is
+        allowed to execute; a second worker attempting the same campaign gets a
+        ``SKIPPED`` summary and never reaches token-spending code.
+        """
+        owner_token = uuid.uuid4()
+        claim = await acquire(experiment_id, owner_token)
+        if claim in (ACQUIRED, RENEWED):
+            self._lease_owner = owner_token
+            try:
+                config = await self._build_config(experiment_id)
+                if config is None:
+                    return None
+                return await self.run_campaign(config)
+            finally:
+                await release(experiment_id, owner_token)
+                self._lease_owner = None
+
+        # Not ours: a concurrent worker owns the lease, the campaign is terminal,
+        # or the row is gone. Return a non-executing summary so the caller can
+        # distinguish "claimed by someone else / already finished" from a run.
+        target_id = await self._get_experiment_target_id(experiment_id)
+        logger.info(
+            "Campaign execution skipped (lease not acquired)",
+            extra={
+                "event_name": "campaign.claim_skipped",
+                "campaign_id": str(experiment_id),
+                "claim": claim,
+            },
+        )
+        return CampaignSummary(
+            experiment_id=experiment_id,
+            target_id=target_id or uuid.uuid4(),
+            total_rounds_executed=0,
+            total_vulnerabilities_found=0,
+            status="SKIPPED",
+            message=f"Campaign not executed: claim {claim}.",
+        )
+
+    async def _get_experiment_target_id(
+        self, experiment_id: uuid.UUID
+    ) -> uuid.UUID | None:
+        async with AsyncSessionLocal() as session:
+            stmt = select(Experiment.target_id).where(
+                Experiment.id == experiment_id
+            )
+            return (await session.execute(stmt)).scalars().first()
 
     async def _build_config(self, experiment_id: uuid.UUID) -> CampaignConfig | None:
         """Build a CampaignConfig from a persisted Experiment record."""
@@ -659,6 +712,11 @@ class CampaignOrchestrator:
         )
 
         if exploring and untried:
+            # Reproducible campaigns (exploration_ratio == 0) walk untried
+            # strategies in registration order instead of rolling dice, so the
+            # mock E2E and audit trails are fully deterministic.
+            if config.exploration_ratio == 0.0:
+                return get_strategy(untried[0])
             return get_strategy(random.choice(untried))
         if known_good:
             # Exploit: pick the strategy that has performed best so far.
@@ -682,10 +740,14 @@ class CampaignOrchestrator:
                 await session.commit()
 
     async def _bump_heartbeat(self, experiment_id: uuid.UUID) -> None:
-        """Worker liveness heartbeat: record that the campaign is actively running."""
+        """Worker liveness heartbeat: record that the campaign is actively
+        running and renew the multi-worker lease in the same write, so an active
+        campaign can never be marked stale or lose its claim mid-run."""
         async with AsyncSessionLocal() as session:
             stmt = select(Experiment).where(Experiment.id == experiment_id)
             experiment = (await session.execute(stmt)).scalars().first()
             if experiment:
                 experiment.heartbeat_at = datetime.now(timezone.utc)
                 await session.commit()
+        if self._lease_owner is not None:
+            await renew(experiment_id, self._lease_owner)

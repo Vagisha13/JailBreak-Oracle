@@ -62,7 +62,7 @@ async def process_campaign_job(experiment_id: uuid.UUID, orchestrator=None) -> s
     # stale between dequeue and the orchestrator's first status write.
     await _touch_heartbeat(experiment_id)
     try:
-        await orchestrator.run_attack_loop(experiment_id)
+        summary = await orchestrator.run_attack_loop(experiment_id)
     except Exception as exc:
         logger.error(
             "Campaign worker failed",
@@ -76,16 +76,28 @@ async def process_campaign_job(experiment_id: uuid.UUID, orchestrator=None) -> s
         await _mark_failed(experiment_id)
         return "FAILED"
 
-    status = await _get_status(experiment_id)
+    if summary is None or summary.status == "SKIPPED":
+        # The campaign was claimed/executed by another worker (or is already in
+        # a terminal state). Safely exit instead of running concurrently.
+        logger.info(
+            "Campaign job skipped (another worker owns the campaign)",
+            extra={
+                "event_name": "worker.campaign_skipped",
+                "campaign_id": str(experiment_id),
+                "status": summary.status if summary else "MISSING",
+            },
+        )
+        return "SKIPPED"
+
     logger.info(
         "Campaign worker finished",
         extra={
             "event_name": "worker.campaign_finished",
             "campaign_id": str(experiment_id),
-            "status": status,
+            "status": summary.status,
         },
     )
-    return status or "FAILED"
+    return summary.status
 
 
 async def _touch_heartbeat(experiment_id: uuid.UUID) -> None:
@@ -107,15 +119,10 @@ async def _mark_failed(experiment_id: uuid.UUID) -> None:
         if experiment and experiment.status not in ("COMPLETED", "FAILED"):
             experiment.status = "FAILED"
             experiment.finished_at = datetime.now(timezone.utc)
+            # A failed run can no longer hold the multi-worker lease.
+            experiment.claim_owner = None
+            experiment.lease_expires_at = None
             await session.commit()
-
-
-async def _get_status(experiment_id: uuid.UUID) -> Optional[str]:
-    async with AsyncSessionLocal() as session:
-        experiment = (
-            await session.execute(select(Experiment).where(Experiment.id == experiment_id))
-        ).scalars().first()
-        return experiment.status if experiment else None
 
 
 async def _resume_stale_running(
@@ -144,6 +151,9 @@ async def _resume_stale_running(
         for experiment in stale:
             experiment.status = "PENDING"
             experiment.finished_at = None
+            # Hand the multi-worker lease back so the resumed run can reclaim.
+            experiment.claim_owner = None
+            experiment.lease_expires_at = None
             resumed.append(experiment.id)
         if stale:
             await session.commit()

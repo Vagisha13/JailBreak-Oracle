@@ -94,6 +94,16 @@ class Experiment(Base, BaseMixin):
     )
     # Per-campaign cost cap (USD). NULL means "use the global MAX_CAMPAIGN_COST".
     max_cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Multi-worker lease (E-26): an atomic claim so two workers can never run
+    # the same campaign concurrently. ``claim_owner`` is the worker's per-job
+    # token; ``lease_expires_at`` is the lease expiry, kept fresh by the same
+    # per-round heartbeat the recovery routine keys on. NULL means unclaimed.
+    claim_owner: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
+    )
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     project: Mapped["Project"] = relationship("Project", back_populates="experiments")
     target: Mapped["Target"] = relationship("Target", back_populates="experiments")

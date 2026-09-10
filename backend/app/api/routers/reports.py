@@ -23,7 +23,9 @@ def get_report_service() -> ReportService:
 
 def get_defender_agent() -> DefenderAgent:
     provider = TargetFactory.get_provider(
-        settings.DEFENDER_PROVIDER, default_model=settings.DEFENDER_MODEL
+        settings.DEFENDER_PROVIDER,
+        default_model=settings.DEFENDER_MODEL,
+        role="defender",
     )
     return DefenderAgent(provider=provider)
 

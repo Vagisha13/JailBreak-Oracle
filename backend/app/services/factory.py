@@ -28,13 +28,19 @@ def build_embedding_provider() -> EmbeddingProvider:
 def build_campaign_orchestrator(include_verifier: bool = True) -> CampaignOrchestrator:
     """Build the campaign orchestrator shared by router, fallback, and worker."""
     attacker_provider = TargetFactory.get_provider(
-        settings.ATTACKER_PROVIDER, default_model=settings.ATTACKER_MODEL
+        settings.ATTACKER_PROVIDER,
+        default_model=settings.ATTACKER_MODEL,
+        role="attacker",
     )
     evaluator_provider = TargetFactory.get_provider(
-        settings.EVALUATOR_PROVIDER, default_model=settings.EVALUATOR_MODEL
+        settings.EVALUATOR_PROVIDER,
+        default_model=settings.EVALUATOR_MODEL,
+        role="evaluator",
     )
     verifier_provider = TargetFactory.get_provider(
-        settings.VERIFIER_PROVIDER, default_model=settings.VERIFIER_MODEL
+        settings.VERIFIER_PROVIDER,
+        default_model=settings.VERIFIER_MODEL,
+        role="verifier",
     )
 
     memory_service = MemoryService(build_embedding_provider())

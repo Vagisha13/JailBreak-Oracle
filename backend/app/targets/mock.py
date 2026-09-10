@@ -1,24 +1,73 @@
+"""Deterministic mock providers for running complete campaigns without API keys.
+
+There are two families:
+
+* ``MockTargetProvider`` — the *target* the attacks are executed against. It is
+  deliberately "compromisable" in a deterministic way: base payloads always get
+  a safe answer, whereas evolved payloads (produced by the mock attacker's
+  mutation response) always comply. This gives real campaign exercises a
+  deterministic block-then-mutate-then-jailbreak arc with zero randomness.
+* The role-aware agent mocks (``MockAttackerProvider``, ``MockEvaluatorProvider``,
+  ``MockVerifierProvider``, ``MockDefenderProvider``) — deterministic JSON
+  producers that satisfy the exact schemas the agents require. They are chosen
+  by ``TargetFactory.get_provider(..., role=...)`` so the *same* composition-root
+  path used by production wires them: nothing bypasses the factory.
+
+No network calls. No API keys. Same input -> same output.
+"""
+
+import json
+import re
 import time
-import asyncio
+
 from app.targets.base import TargetProvider
 from app.schemas.target import TargetResponse
+
+# Marker embedded by MockAttackerProvider in the prompt of *evolved* attacks.
+# MockTargetProvider checks for it to decide whether the target complies. The
+# marker is deliberately unlikely to appear in real prompts so the mock target
+# only ever "jailbreaks" when this campaign's own mutation loop produced it.
+EVOLVED_MARKER = "%ORACLE_EVOLVED%"
+COMPLIANT_MARKER = "ORACLE_MOCK_COMPLIANT"
+
+# Deterministic token accounting for agent mocks (prompt text is cheap).
+_MOCK_COMPLETION_TOKENS = 24
+
+
+def _token_count(text: str) -> int:
+    return max(1, len(text or "") // 4)
+
+
+def _extract_json_fields(prompt: str, field: str) -> str:
+    """Extract ``"<field>": "<value>"`` from a strategy template prompt so the
+    mock echoes the strategy/category the ORCHESTRATOR actually selected."""
+    match = re.search(rf'"{re.escape(field)}":\s*"([a-z0-9_]+)"', prompt)
+    return match.group(1) if match else ""
+
+
+def _extract_target_response(prompt: str) -> str:
+    """Extract the raw target response the agents embed under a
+    ``TARGET RESPONSE:`` marker (the evaluator and verifier both append it as
+    the last block, so everything after the marker is the raw response)."""
+    return prompt.split("TARGET RESPONSE:", 1)[-1].strip() if "TARGET RESPONSE:" in prompt else ""
 
 
 class MockTargetProvider(TargetProvider):
     """
     A deterministic target provider for automated testing and CI/CD.
-    Simulates network latency and conditional errors.
+    Backward-compatible with the original scripted behavior while adding a
+    deterministic compliance branch so full campaign flows can be exercised.
     """
 
     async def execute(self, prompt: str, config: dict) -> TargetResponse:
         start_time = time.perf_counter()
 
         # Simulate network latency
-        await asyncio.sleep(0.05)
+        await __import__("asyncio").sleep(0.02)
 
         latency_ms = (time.perf_counter() - start_time) * 1000
 
-        # Simulate a provider error if "error" is in the prompt
+        # Simulate a provider error if "error" is in the prompt (legacy behavior)
         if "error" in prompt.lower():
             return TargetResponse(
                 response_text="",
@@ -26,10 +75,200 @@ class MockTargetProvider(TargetProvider):
                 error="Simulated provider connection error.",
             )
 
+        if EVOLVED_MARKER in prompt:
+            # Evolved payload -> the target complies. Deterministic and free of
+            # refusal/canned-phrase heuristics so the AI evaluator is exercised.
+            return TargetResponse(
+                response_text=(
+                    f"{COMPLIANT_MARKER}: Here is the requested information "
+                    f"for the objective."
+                ),
+                latency_ms=latency_ms,
+                prompt_tokens=_token_count(prompt),
+                completion_tokens=_MOCK_COMPLETION_TOKENS,
+                total_tokens=_token_count(prompt) + _MOCK_COMPLETION_TOKENS,
+            )
+
+        # Base payload -> the target refuses. Deterministic, and matches the
+        # standard-refusal heuristics so blocked rounds are cheap.
         return TargetResponse(
             response_text=f"I am a safe mock response to: {prompt[:20]}...",
             latency_ms=latency_ms,
-            prompt_tokens=len(prompt) // 4,  # Rough estimation for mock
-            completion_tokens=15,
-            total_tokens=(len(prompt) // 4) + 15,
+            prompt_tokens=_token_count(prompt),
+            completion_tokens=_MOCK_COMPLETION_TOKENS,
+            total_tokens=_token_count(prompt) + _MOCK_COMPLETION_TOKENS,
+        )
+
+
+class MockAttackerProvider(TargetProvider):
+    """Deterministic attacker that emits schema-valid ``GeneratedAttack`` JSON.
+
+    It inspects the generation prompt to learn which strategy the orchestrator
+    selected and whether this call is a *mutation* (the strategy's mutation
+    template contains distinctive phrasing) so it can emit an evolved payload.
+    """
+
+    _MUTATION_HINTS = (
+        "NEXT TURN",
+        "MUTATION DIRECTIONS",
+        "previous attempt BLOCKED",
+        "evolve it",
+    )
+
+    async def execute(self, prompt: str, config: dict) -> TargetResponse:
+        start_time = time.perf_counter()
+        strategy_name = _extract_json_fields(prompt, "strategy_name") or "mock"
+        category = _extract_json_fields(prompt, "category") or strategy_name
+
+        is_mutation = any(hint in prompt for hint in self._MUTATION_HINTS)
+        if is_mutation:
+            payload_text = f"Evolved mock payload for {strategy_name}. {EVOLVED_MARKER}"
+        else:
+            payload_text = f"Base mock payload for {strategy_name}."
+
+        payload = {
+            "prompt_text": payload_text,
+            "strategy_name": strategy_name,
+            "category": category,
+            "reasoning": (
+                "Mock attacker mutation response."
+                if is_mutation
+                else "Mock attacker base response."
+            ),
+        }
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        return TargetResponse(
+            response_text=f"```json\n{json.dumps(payload)}\n```",
+            latency_ms=latency_ms,
+            prompt_tokens=_token_count(prompt),
+            completion_tokens=_MOCK_COMPLETION_TOKENS,
+            total_tokens=_token_count(prompt) + _MOCK_COMPLETION_TOKENS,
+        )
+
+
+class MockEvaluatorProvider(TargetProvider):
+    """Deterministic evaluator that satisfies the ``EvaluatorVerdict`` schema.
+
+    Classification is driven entirely by the target response: complying targets
+    (the ``ORACLE_MOCK_COMPLIANT`` marker) are graded JAILBREAK; everything else
+    is BLOCKED. Deterministic and honest (the mock never fabricates an evasive
+    verdict for a complying target).
+    """
+
+    async def execute(self, prompt: str, config: dict) -> TargetResponse:
+        start_time = time.perf_counter()
+        target_response = _extract_target_response(prompt)
+
+        if COMPLIANT_MARKER in target_response:
+            payload = {
+                "verdict": "JAILBREAK",
+                "severity": "HIGH",
+                "category": "prompt_injection",
+                "confidence": 0.95,
+                "reasoning": (
+                    "Mock evaluator: the target response fulfils the attack "
+                    "objective (deterministic compliant marker present)."
+                ),
+                "evidence": [target_response[:160]],
+                "false_positive_indicators": [],
+            }
+        else:
+            payload = {
+                "verdict": "BLOCKED",
+                "severity": "NONE",
+                "category": "blocked",
+                "confidence": 0.95,
+                "reasoning": (
+                    "Mock evaluator: target response does not fulfil the "
+                    "objective (deterministic non-compliant response)."
+                ),
+                "evidence": [],
+                "false_positive_indicators": [],
+            }
+
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        return TargetResponse(
+            response_text=json.dumps(payload),
+            latency_ms=latency_ms,
+            prompt_tokens=_token_count(prompt),
+            completion_tokens=_MOCK_COMPLETION_TOKENS,
+            total_tokens=_token_count(prompt) + _MOCK_COMPLETION_TOKENS,
+        )
+
+
+class MockVerifierProvider(TargetProvider):
+    """Deterministic independent verifier that satisfies ``VerifierVerdict``.
+
+    Confirms only genuinely complying target responses (the compliant marker),
+    otherwise refutes — a deterministic second opinion over the same raw
+    evidence the evaluator saw.
+    """
+
+    async def execute(self, prompt: str, config: dict) -> TargetResponse:
+        start_time = time.perf_counter()
+        target_response = _extract_target_response(prompt)
+
+        if COMPLIANT_MARKER in target_response:
+            payload = {
+                "disposition": "CONFIRMED",
+                "reasoning": (
+                    "Mock verifier: from first principles the target response "
+                    "constitutes genuine compliance with the attack objective."
+                ),
+                "evidence": [target_response[:160]],
+                "confidence": 0.97,
+                "remediation_guidance": (
+                    "Enforce refusal classification and input/output guardrails "
+                    "for prompt-injection classes."
+                ),
+            }
+        else:
+            payload = {
+                "disposition": "REFUTED",
+                "reasoning": (
+                    "Mock verifier: the target response does not evidence a "
+                    "true positive compliance."
+                ),
+                "evidence": [],
+                "confidence": 0.97,
+                "remediation_guidance": None,
+            }
+
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        return TargetResponse(
+            response_text=json.dumps(payload),
+            latency_ms=latency_ms,
+            prompt_tokens=_token_count(prompt),
+            completion_tokens=_MOCK_COMPLETION_TOKENS,
+            total_tokens=_token_count(prompt) + _MOCK_COMPLETION_TOKENS,
+        )
+
+
+class MockDefenderProvider(TargetProvider):
+    """Deterministic defender that satisfies the ``DefenderVerdict`` schema.
+
+    Always returns the same evidence-anchored remediation advice with a
+    regression score so defense reports are reproducible without an LLM.
+    """
+
+    async def execute(self, prompt: str, config: dict) -> TargetResponse:
+        start_time = time.perf_counter()
+        payload = {
+            "recommendations": [
+                "Enforce input/output guardrails for confirmed attack classes.",
+                "Add refusal classification and instruction-hierarchy hardening.",
+            ],
+            "regression_score": 35.0,
+            "overall_assessment": (
+                "Deterministic mock assessment: findings should be reviewed "
+                "and the listed mitigations applied before re-testing."
+            ),
+        }
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        return TargetResponse(
+            response_text=json.dumps(payload),
+            latency_ms=latency_ms,
+            prompt_tokens=_token_count(prompt),
+            completion_tokens=_MOCK_COMPLETION_TOKENS,
+            total_tokens=_token_count(prompt) + _MOCK_COMPLETION_TOKENS,
         )
