@@ -84,8 +84,8 @@ async def lifespan(app: FastAPI):
         else:
             reason = health.get("reason", "unknown")
             raise RuntimeError(
-                f"REDIS_URL is configured but Redis is unreachable ({reason}). "
-                "Start Redis or remove REDIS_URL to run degraded."
+                f"REDIS_URL is configured but Redis is unusable ({reason}). "
+                "Fix REDIS_URL/Redis or remove REDIS_URL to run degraded."
             )
     yield
 

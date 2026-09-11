@@ -128,12 +128,58 @@ async def redis_available() -> bool:
 
 
 async def check_health() -> dict:
-    """Shape the ``/health`` response's ``redis`` section."""
+    """Shape the ``/health`` response's ``redis`` section.
+
+    Stronger than a bare ping: also checks the *responding* server's version so
+    the app never silently talks to an old/foreign Redis instance that happens
+    to answer on the configured host and port (e.g. a stale non-Docker "Redis
+    for Windows" service shadowing the Docker container's published 6379).
+    """
     if not settings.REDIS_URL:
         return {"available": False, "reason": "REDIS_URL not set"}
-    if await redis_available():
-        return {"available": True}
-    return {"available": False, "reason": "unreachable"}
+    if circuit_open():
+        return {"available": False, "reason": "unreachable (recent connection failure)"}
+    client = get_redis_client()
+    if client is None:
+        return {"available": False, "reason": "Redis client could not be initialized"}
+    try:
+        info = await client.info("server")
+    except Exception as exc:
+        _trip_circuit(type(exc).__name__)
+        return {"available": False, "reason": "unreachable"}
+    server_version = str(info.get("redis_version", ""))
+    if server_version and server_version_too_old(server_version, settings.REDIS_MIN_VERSION):
+        _trip_circuit("IncompatibleRedisVersion")
+        return {
+            "available": False,
+            "reason": (
+                f"incompatible Redis version {server_version} "
+                f"(minimum {settings.REDIS_MIN_VERSION} required). Another "
+                "(likely old) Redis instance answered on the configured host/port - "
+                "on Windows run `netstat -ano | findstr :6379` and stop the stale "
+                "service shadowing the Docker container."
+            ),
+        }
+    return {"available": True, "redis_version": server_version}
+
+
+def parse_version(version: str) -> tuple[int, int, int]:
+    """Parse a dotted Redis version into ``(major, minor, patch)``.
+
+    Missing parts default to 0 so ``"7"`` and ``"7.4"`` compare as expected.
+    """
+    parts: list[int] = []
+    for chunk in version.split(".")[:3]:
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return parts[0], parts[1], parts[2]
+
+
+def server_version_too_old(server_version: str, minimum: str) -> bool:
+    """True when ``server_version`` predates ``minimum``."""
+    return parse_version(server_version) < parse_version(minimum)
 
 
 async def reset() -> None:

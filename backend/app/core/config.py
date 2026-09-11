@@ -98,6 +98,10 @@ class Settings(BaseSettings):
     # the app runs degraded (in-memory limiting / in-process queue).
     REDIS_RETRY_SECONDS: float = 30.0
     REDIS_CONNECT_TIMEOUT_SECONDS: float = 2.0
+    # Minimum Redis server version the application will talk to. The shared
+    # health probe fails fast when the responding server is older (e.g. a stale
+    # non-Docker "Redis for Windows" service shadowing the container's port).
+    REDIS_MIN_VERSION: str = "6.0.0"
 
     # ── Target Agents (external LLM endpoints) ─────────────────
     # Types accepted by TargetProviderFactory.
@@ -182,6 +186,13 @@ class Settings(BaseSettings):
         if not self.REDIS_URL:
             raise RuntimeError(
                 "REDIS_URL must be set in production (required for the campaign worker)."
+            )
+
+        redis_scheme = self.REDIS_URL.split(":", 1)[0]
+        if redis_scheme not in {"redis", "rediss"}:
+            raise RuntimeError(
+                f"REDIS_URL must start with redis:// or rediss:// "
+                f"(got scheme {redis_scheme!r})."
             )
 
 
