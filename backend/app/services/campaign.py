@@ -1,6 +1,7 @@
 ﻿import uuid
 from datetime import datetime, timezone
 
+from sqlalchemy import update as sa_update
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 
@@ -8,6 +9,7 @@ from app.db.session import AsyncSessionLocal
 from app.models.domain import (
     AgentRun,
     Attack,
+    CampaignJob,
     Experiment,
     Target,
     TokenUsage,
@@ -116,44 +118,6 @@ class CampaignOrchestrator:
             await session.commit()
             await session.refresh(experiment)
             return experiment.id
-
-    async def record_campaign_failure(
-        self, experiment_id: uuid.UUID, reason: str = "execution_error"
-    ) -> None:
-        """Mark a campaign FAILED without running it (e.g. queue unavailable).
-
-        Guaranteed-visible failure semantics (S3): once a campaign is terminal
-        the worker lease is unclaimable, so a FAILED row can never be silently
-        started by a later worker.
-        """
-        async with AsyncSessionLocal() as session:
-            stmt = select(Experiment).where(Experiment.id == experiment_id)
-            experiment = (await session.execute(stmt)).scalars().first()
-            if experiment is None:
-                return
-            experiment.status = "FAILED"
-            experiment.finished_at = datetime.now(timezone.utc)
-            experiment.heartbeat_at = datetime.now(timezone.utc)
-            session.add(
-                AgentRun(
-                    experiment_id=experiment_id,
-                    agent_type="campaign",
-                    state_json={
-                        "status": "FAILED",
-                        "reason": reason,
-                        "error_type": "queue_unavailable"
-                        if reason == "queue_unavailable"
-                        else "manual_failure",
-                        "message": (
-                            "Campaign worker queue (Redis) is unavailable; "
-                            "campaign was not started."
-                            if reason == "queue_unavailable"
-                            else reason
-                        ),
-                    },
-                )
-            )
-            await session.commit()
 
     async def run_attack_loop(self, experiment_id: uuid.UUID):
         """Execute the full adaptive attack loop for an experiment.
@@ -1002,12 +966,24 @@ class CampaignOrchestrator:
     async def _bump_heartbeat(self, experiment_id: uuid.UUID) -> None:
         """Worker liveness heartbeat: record that the campaign is actively
         running and renew the multi-worker lease in the same write, so an active
-        campaign can never be marked stale or lose its claim mid-run."""
+        campaign can never be marked stale or lose its claim mid-run.
+
+        The queue job is heartbeated in the same write (E-25 reuse) so job-level
+        stale recovery keys on the same activity signal as experiment recovery.
+        """
         async with AsyncSessionLocal() as session:
             stmt = select(Experiment).where(Experiment.id == experiment_id)
             experiment = (await session.execute(stmt)).scalars().first()
             if experiment:
                 experiment.heartbeat_at = datetime.now(timezone.utc)
-                await session.commit()
+            await session.execute(
+                sa_update(CampaignJob)
+                .where(
+                    CampaignJob.experiment_id == experiment_id,
+                    CampaignJob.status == "RUNNING",
+                )
+                .values(heartbeat_at=datetime.now(timezone.utc))
+            )
+            await session.commit()
         if self._lease_owner is not None:
             await renew(experiment_id, self._lease_owner)

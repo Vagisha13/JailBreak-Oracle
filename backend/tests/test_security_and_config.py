@@ -46,6 +46,13 @@ async def test_security_headers_can_be_disabled(api_client, monkeypatch):
     assert "x-content-type-options" not in resp.headers
 
 
+def _production_firebase_creds(monkeypatch) -> None:
+    """Make settings pass the production Firebase requirement."""
+    monkeypatch.setattr(settings, "FIREBASE_PROJECT_ID", "oracle-prod")
+    monkeypatch.setattr(settings, "FIREBASE_CLIENT_EMAIL", "svc@oracle-prod.iam.gserviceaccount.com")
+    monkeypatch.setattr(settings, "FIREBASE_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----")
+
+
 def test_production_requires_secret_key(monkeypatch):
     monkeypatch.setattr(settings, "APP_ENV", "production")
     monkeypatch.setattr(settings, "SECRET_KEY", None)
@@ -54,7 +61,7 @@ def test_production_requires_secret_key(monkeypatch):
         "ASYNC_DATABASE_URL",
         "postgresql+asyncpg://user:pass@localhost:5432/oracle",
     )
-    monkeypatch.setattr(settings, "REDIS_URL", "redis://localhost:6379")
+    _production_firebase_creds(monkeypatch)
     with pytest.raises(RuntimeError, match="SECRET_KEY"):
         settings.validate_critical_secrets()
 
@@ -63,12 +70,12 @@ def test_production_requires_postgres(monkeypatch):
     monkeypatch.setattr(settings, "APP_ENV", "production")
     monkeypatch.setattr(settings, "SECRET_KEY", "prod-secret")
     monkeypatch.setattr(settings, "ASYNC_DATABASE_URL", "sqlite+aiosqlite:///./oracle.db")
-    monkeypatch.setattr(settings, "REDIS_URL", "redis://localhost:6379")
+    _production_firebase_creds(monkeypatch)
     with pytest.raises(RuntimeError, match="PostgreSQL"):
         settings.validate_critical_secrets()
 
 
-def test_production_requires_redis(monkeypatch):
+def test_production_requires_firebase(monkeypatch):
     monkeypatch.setattr(settings, "APP_ENV", "production")
     monkeypatch.setattr(settings, "SECRET_KEY", "prod-secret")
     monkeypatch.setattr(
@@ -76,8 +83,14 @@ def test_production_requires_redis(monkeypatch):
         "ASYNC_DATABASE_URL",
         "postgresql+asyncpg://user:pass@localhost:5432/oracle",
     )
-    monkeypatch.setattr(settings, "REDIS_URL", None)
-    with pytest.raises(RuntimeError, match="REDIS_URL"):
+# No FIREBASE_* credentials: the distributed rate limiter would have no store.
+    monkeypatch.setattr(settings, "FIREBASE_PROJECT_ID", None)
+    monkeypatch.setattr(settings, "FIREBASE_CLIENT_EMAIL", None)
+    monkeypatch.setattr(settings, "FIREBASE_PRIVATE_KEY", None)
+    # The test suite session disables rate limiting; the production gate only
+    # applies when rate limiting is on, so restore it specifically here.
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    with pytest.raises(RuntimeError, match="Firebase"):
         settings.validate_critical_secrets()
 
 
@@ -89,7 +102,10 @@ def test_production_configuration_validates_cleanly(monkeypatch):
         "ASYNC_DATABASE_URL",
         "postgresql+asyncpg://user:pass@localhost:5432/oracle",
     )
-    monkeypatch.setattr(settings, "REDIS_URL", "redis://localhost:6379")
+    _production_firebase_creds(monkeypatch)
+    # The test suite session disables rate limiting; put it back so the Firebase
+    # gate is actually exercised by this "must not raise" check.
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
     settings.validate_critical_secrets()  # must not raise
 
 

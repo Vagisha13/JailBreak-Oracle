@@ -1,9 +1,12 @@
 # Jailbreak Oracle — full local stack.
 #
-#   db (pgvector) + redis  ->  backend API  +  worker  +  frontend
+#   db (pgvector)  ->  backend API  +  worker  +  frontend
 #
 # Secrets come from the repo-root `.env` file (see README "Docker quickstart").
 # `SECRET_KEY` is mandatory; set it before running compose-up.
+#
+# Distributed rate limiting uses Cloud Firestore (Firebase Admin SDK), so no
+# Redis service exists. PostgreSQL remains the only stateful datastore here.
 
 services:
   db:
@@ -24,18 +27,6 @@ services:
       retries: 10
     restart: unless-stopped
 
-  redis:
-    image: redis:7-alpine
-    container_name: oracle_redis
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    restart: unless-stopped
-
   backend:
     build: ./backend
     container_name: oracle_backend
@@ -44,7 +35,9 @@ services:
       LOG_LEVEL: INFO
       ASYNC_DATABASE_URL: postgresql+asyncpg://oracle_user:oracle_password@db:5432/oracle_db
       SYNC_DATABASE_URL: postgresql+psycopg2://oracle_user:oracle_password@db:5432/oracle_db
-      REDIS_URL: redis://redis:6379/0
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:?FIREBASE_PROJECT_ID must be set (see README "Docker quickstart")}
+      FIREBASE_CLIENT_EMAIL: ${FIREBASE_CLIENT_EMAIL:?FIREBASE_CLIENT_EMAIL must be set}
+      FIREBASE_PRIVATE_KEY: ${FIREBASE_PRIVATE_KEY}
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set (see README "Docker quickstart")}
       BOOTSTRAP_ADMIN_EMAILS: ${BOOTSTRAP_ADMIN_EMAILS:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -69,8 +62,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      redis:
-        condition: service_healthy
     restart: unless-stopped
 
   worker:
@@ -80,8 +71,6 @@ services:
     environment: *backend_env
     depends_on:
       db:
-        condition: service_healthy
-      redis:
         condition: service_healthy
       backend:
         condition: service_started

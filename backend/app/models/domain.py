@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
-from sqlalchemy import String, Text, Float, Integer, ForeignKey, DateTime, JSON, Boolean
+from sqlalchemy import String, Text, Float, Integer, ForeignKey, DateTime, JSON, Boolean, Index, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 from pgvector.sqlalchemy import Vector
@@ -278,4 +278,63 @@ class AttackMutation(Base, BaseMixin):
     mutated_prompt: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
+    )
+
+
+class CampaignJob(Base, BaseMixin):
+    """Durable PostgreSQL-backed campaign job queue row.
+
+    Queue state is deliberately separate from the ``experiments`` row: the
+    experiment owns the campaign's domain state (status, lease, budget,
+    heartbeat); the job owns when/whether a worker should run it. A worker
+    claims a job atomically (``FOR UPDATE SKIP LOCKED`` + status CAS), then the
+    campaign's own PostgreSQL lease decides which worker may actually execute.
+
+    At most one *active* (PENDING/RUNNING) job can exist per experiment; the
+    partial unique index enforces enqueue idempotency. Once a job is terminal
+    (COMPLETED/FAILED) a future enqueue creates a fresh row (e.g. an experiment
+    re-queued after stale recovery).
+    """
+
+    __tablename__ = "campaign_jobs"
+    __table_args__ = (
+        Index(
+            "uq_campaign_jobs_active_experiment",
+            "experiment_id",
+            unique=True,
+            sqlite_where=text("status IN ('PENDING', 'RUNNING')"),
+            postgresql_where=text("status IN ('PENDING', 'RUNNING')"),
+        ),
+    )
+
+    experiment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("experiments.id", ondelete="CASCADE"), index=True
+    )
+    # PENDING -> RUNNING -> COMPLETED | FAILED (terminal statuses never re-run).
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True)
+    # Number of times a worker has claimed/started this job (retries are bounded).
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    # Earliest moment the job may be claimed. On retry it is pushed into the
+    # future (+ backoff) so failed jobs cool down before the next attempt.
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, index=True
+    )
+    started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Worker liveness: bumped alongside the experiment's per-round heartbeat so
+    # stale-recovery keys on activity, never row age.
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Persisted, queryable failure reason (truncated, secret-safe at the source).
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )

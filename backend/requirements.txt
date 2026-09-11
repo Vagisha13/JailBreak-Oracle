@@ -19,7 +19,13 @@ passlib[bcrypt]>=1.7.4
 bcrypt==4.0.1
 python-multipart>=0.0.7
 aiosqlite>=0.20.0
-redis>=5.0.0
+# Firebase Admin SDK — server-side Cloud Firestore for distributed rate limiting
+# (postgreSQL remains the system of record; Firestore is not used for app data).
+# Capped <6.9.0 because 6.9+/7.x pin httpx[http2]==0.28.1, which conflicts with
+# the pinned httpx==0.27.0 stack required by litellm and starlette's TestClient.
+# Firestore only needs google-api-core[grpc]/google-cloud-firestore (gRPC), so
+# the SDK's httpx REST path is never used.
+firebase-admin>=6.5.0,<6.9.0
 pytest==8.1.1
 pytest-asyncio==0.23.5
 httpx==0.27.0

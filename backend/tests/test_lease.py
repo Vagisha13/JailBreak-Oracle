@@ -38,7 +38,6 @@ from app.services.campaign import CampaignOrchestrator
 from app.services.memory import MemoryService
 from app.agents.attacker import AttackerAgent
 from app.agents.evaluator import EvaluatorAgent
-from app.services.queue import enqueue_campaign, dequeue_campaign
 from app.targets.embeddings import MockEmbeddingProvider
 from app.targets.base import TargetProvider
 from app.schemas.target import TargetResponse
@@ -381,29 +380,3 @@ async def test_clear_lease_unconditionally():
     exp = await _row(experiment_id)
     assert exp.claim_owner is None
     assert exp.lease_expires_at is None
-
-
-@pytest.mark.asyncio
-async def test_queue_round_trip_unchanged():
-    """The queue protocol is untouched by the lease; duplicate jobs are resolved
-    by the DB claim, not by queue dedup."""
-
-    class _FakeRedis:
-        def __init__(self):
-            self.list = []
-
-        async def rpush(self, key, value):
-            self.list.append((key, value.encode()))
-            return len(self.list)
-
-        async def blpop(self, key, timeout=0):
-            if not self.list:
-                return None
-            return self.list.pop(0)
-
-    fake_redis = _FakeRedis()
-    experiment_id = await _create_experiment(attack_budget=1)
-    assert await enqueue_campaign(experiment_id, redis_client=fake_redis) is True
-    assert await enqueue_campaign(experiment_id, redis_client=fake_redis) is True
-    assert await dequeue_campaign(redis_client=fake_redis, timeout=0) == experiment_id
-    assert await dequeue_campaign(redis_client=fake_redis, timeout=0) == experiment_id

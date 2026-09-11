@@ -1,37 +1,53 @@
-"""Redis-backed campaign worker.
+"""PostgreSQL-backed campaign worker.
 
 Long-running campaign execution is handled by this persistent worker process
-instead of FastAPI ``BackgroundTasks``. The worker reads campaign jobs from a
-Redis queue, executes them, and updates the persisted campaign state:
+instead of FastAPI ``BackgroundTasks``. The worker claims jobs from the
+durable ``campaign_jobs`` PostgreSQL queue (``app.services.queue``), executes
+them, and updates the persisted campaign state:
 
     PENDING -> RUNNING -> COMPLETED
-    PENDING -> RUNNING -> FAILED
+    PENDING -> RUNNING -> FAILED (after bounded retries)
 
 Run with: ``python -m app.worker`` (or the ``worker`` service in Docker).
 
 Guarantees:
-  * A worker crash cannot leave a campaign permanently RUNNING: stale RUNNING
-    campaigns are revereted to PENDING and re-queued on startup so they resume
-    from persisted DB round state instead of restarting from scratch.
-  * PENDING campaigns are re-queued after the grace period.
-  * Provider failures mark the campaign FAILED (never stuck RUNNING).
+  * A worker crash cannot lose a job: the job row stays RUNNING and is
+    re-admitted to the queue by stale recovery on the next worker startup,
+    resuming a campaign from its persisted DB round state.
+  * Failed jobs retry with backoff up to ``CAMPAIGN_JOB_MAX_ATTEMPTS``; the
+    last failure reason is persisted on the job and the experiment.
+  * Two workers never execute the same job (atomic claim) and never execute
+    the same campaign concurrently (the existing PostgreSQL experiment lease).
+  * The queue is scheduling state only; experiment ownership stays with
+    ``app.services.lease``.
 """
 import asyncio
+import signal
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from sqlalchemy import update as sa_update
 from sqlalchemy.future import select
 
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.session import AsyncSessionLocal
-from app.models.domain import Experiment
-from app.services.queue import dequeue_campaign, enqueue_campaign
+from app.models.domain import AgentRun, CampaignJob, Experiment
+from app.services.queue import (
+    JOB_COMPLETED,
+    RETRYABLE,
+    claim_next_job,
+    enqueue_campaign,
+    fail_job,
+    mark_job_completed,
+    recover_stale_jobs,
+)
 
 logger = get_logger("worker")
 
 PENDING_GRACE_SECONDS = 300
+JOB_POLL_INTERVAL_SECONDS = 2
 
 
 def _aware(dt: datetime) -> datetime:
@@ -49,7 +65,11 @@ def build_orchestrator():
 
 
 async def process_campaign_job(experiment_id: uuid.UUID, orchestrator=None) -> str:
-    """Execute a single queued campaign job. Returns the terminal status."""
+    """Execute a single campaign. Returns the terminal execution status.
+
+    Kept queue-agnostic so the lease/execution tests exercise it directly.
+    Queue bookkeeping (claim/retry/complete) lives in :func:`execute_job`.
+    """
     orchestrator = orchestrator or build_orchestrator()
     logger.info(
         "Worker processing campaign job",
@@ -98,6 +118,71 @@ async def process_campaign_job(experiment_id: uuid.UUID, orchestrator=None) -> s
         },
     )
     return summary.status
+
+
+async def execute_job(job: CampaignJob, orchestrator=None) -> str:
+    """Claim-owned wrapper: run the campaign, then settle the job row.
+
+    COMPLETED -> the job is done. SKIPPED -> another owner already finished the
+    campaign; the job is closed out (nothing to re-run). FAILED -> the job is
+    retired or retried; retries reset the experiment to PENDING so the next
+    attempt can re-acquire the campaign lease.
+    """
+    status = await process_campaign_job(job.experiment_id, orchestrator)
+
+    if status in ("COMPLETED", "SKIPPED"):
+        note = "skipped (campaign already owned/terminal)" if status == "SKIPPED" else None
+        await mark_job_completed(job.id, status=JOB_COMPLETED, note=note)
+        return status
+
+    outcome = await fail_job(
+        job.id,
+        error=await _last_campaign_failure(job.experiment_id)
+        or f"campaign {job.experiment_id} execution failed",
+    )
+    if outcome == RETRYABLE:
+        await _reset_experiment_for_retry(job.experiment_id)
+    return status
+
+
+async def _last_campaign_failure(experiment_id: uuid.UUID) -> Optional[str]:
+    """Fetch the campaign's persisted failure reason (same source the status
+    endpoint reads) so the job's ``last_error`` is queryable and truthful."""
+    async with AsyncSessionLocal() as session:
+        stmt = (
+            select(AgentRun.state_json)
+            .where(
+                AgentRun.experiment_id == experiment_id,
+                AgentRun.agent_type == "campaign",
+            )
+            .order_by(AgentRun.created_at.desc())
+        )
+        for (state,) in (await session.execute(stmt)).all():
+            if isinstance(state, dict) and state.get("status") == "FAILED":
+                reason = state.get("reason") or "execution_error"
+                error_type = state.get("error_type")
+                message = state.get("error_message")
+                detail = f" ({error_type}): {message}" if error_type else ""
+                return f"{reason}{detail}"
+    return None
+
+
+async def _reset_experiment_for_retry(experiment_id: uuid.UUID) -> None:
+    """Return a FAILED campaign to PENDING so a retried job can re-acquire the
+    lease. Mirrors stale-recovery: clears the claim token + expiry."""
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            sa_update(Experiment)
+            .where(Experiment.id == experiment_id)
+            .values(
+                status="PENDING",
+                finished_at=None,
+                heartbeat_at=datetime.now(timezone.utc),
+                claim_owner=None,
+                lease_expires_at=None,
+            )
+        )
+        await session.commit()
 
 
 async def _touch_heartbeat(experiment_id: uuid.UUID) -> None:
@@ -228,27 +313,66 @@ async def recover_stale_campaigns(
     }
 
 
-async def worker_loop() -> None:
-    """Main worker loop: recover, then pull jobs from the queue forever."""
+async def worker_loop(stop: Optional[asyncio.Event] = None) -> None:
+    """Recover stale state, then claim and run durable queue jobs forever.
+
+    ``stop`` enables graceful shutdown: once set, the worker finishes any
+    in-flight job and stops claiming new ones (no abandoned mid-execution work).
+    """
     logger.info(
         "Campaign worker started",
-        extra={"event_name": "worker.started", "queue": "oracle:campaign:jobs"},
+        extra={"event_name": "worker.started", "queue": "postgresql:campaign_jobs"},
     )
     await recover_stale_campaigns()
+    await recover_stale_jobs()
 
-    while True:
-        job = await dequeue_campaign(timeout=5)
+    while stop is None or not stop.is_set():
+        job = await claim_next_job()
         if job is None:
+            await asyncio.sleep(JOB_POLL_INTERVAL_SECONDS)
             continue
-        await process_campaign_job(job)
+        try:
+            await execute_job(job)
+        except Exception as exc:
+            # A crash inside execution must never kill the worker process: the
+            # job is left RUNNING and stale-recovery re-admits it on restart.
+            logger.error(
+                "Unhandled error while executing campaign job",
+                extra={
+                    "event_name": "worker.job_unhandled",
+                    "job_id": str(job.id),
+                    "campaign_id": str(job.experiment_id),
+                    "error_type": type(exc).__name__,
+                },
+                exc_info=True,
+            )
+
+    logger.info("Campaign worker stopped", extra={"event_name": "worker.stopped"})
 
 
 def main() -> None:
     """Entrypoint for ``python -m app.worker``."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    stop = asyncio.Event()
+    handled = False
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+            handled = True
+        except (NotImplementedError, RuntimeError):
+            # Windows / restricted environments: rely on KeyboardInterrupt.
+            continue
     try:
-        asyncio.run(worker_loop())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Campaign worker stopped", extra={"event_name": "worker.stopped"})
+        loop.run_until_complete(worker_loop(stop=stop if handled else None))
+    except KeyboardInterrupt:
+        logger.info("Campaign worker interrupted", extra={"event_name": "worker.interrupted"})
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:  # pragma: no cover - loop teardown is best-effort
+            pass
+        loop.close()
 
 
 if __name__ == "__main__":

@@ -5,8 +5,9 @@ feedback-driven attack campaigns against target LLM endpoints, independently
 verifies suspected jailbreaks, quantifies campaign spend, and ships analytics
 plus reproducible benchmarks.
 
-- **Backend**: FastAPI (Python 3.11), SQLAlchemy 2 async, Pydantic v2, Redis
-  job queue + worker, PostgreSQL + pgvector (SQLite supported for dev/tests).
+- **Backend**: FastAPI (Python 3.11), SQLAlchemy 2 async, Pydantic v2,
+  durable PostgreSQL job queue + worker, PostgreSQL + pgvector (SQLite
+  supported for dev/tests), Firebase Firestore for distributed rate limiting.
 - **Frontend**: Next.js 16 / React 19 (dashboard, campaigns, reports, findings,
   mutation tree, budget panel); security headers, `poweredByHeader` off, and a
   Vitest smoke suite for the API client.
@@ -49,8 +50,9 @@ plus reproducible benchmarks.
        ├─ AttackerAgent ──► MemoryService (pgvector | keyword fallback)
        ├─ ExecutionService ─► TargetProvider (LiteLLM / Mock)
        ├─ MutationEngine ──► lineage + dedup + budget
-       └─ queue.py ──► Redis ──► worker.py (app/worker.py)
+       └─ queue.py ──► campaign_jobs (PostgreSQL) ──► worker.py (app/worker.py)
 
+  rate limiting ──► Cloud Firestore (Firebase Admin SDK; fails closed, 503)
   config.py (pydantic-settings) ◄── .env
   session.py (async SQLAlchemy) ◄── SQLite dev | PostgreSQL+pgvector prod
 ```
@@ -70,10 +72,10 @@ In a second terminal:
 cd frontend && npm install && npm run dev   # frontend on http://localhost:3000
 ```
 
-Optional: run the durable campaign worker (requires Redis):
+Optional: run the durable campaign worker (PostgreSQL-backed):
 
 ```bash
-make worker                # Redis-backed campaign worker (python -m app.worker)
+make worker                # campaign worker (python -m app.worker)
 ```
 
 ## Docker quickstart (full stack)
@@ -85,43 +87,26 @@ docker compose up --build -d
 docker compose run --rm backend alembic upgrade head   # create schema
 ```
 
-This brings up `db` (pgvector), `redis`, `backend` (:8000), `worker`, and
+This brings up `db` (pgvector), `backend` (:8000), `worker`, and
 `frontend` (:3000). The frontend is configured to call
 `http://localhost:8000/api/v1`.
 
-A repo-root `.env` file is consumed by `docker compose`; the only mandatory
-variable is `SECRET_KEY` (the compose file fails loudly if it's missing).
-LLM API keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`) and
-`BOOTSTRAP_ADMIN_EMAILS` are optional but required to use real providers.
+A repo-root `.env` file is consumed by `docker compose`; `SECRET_KEY` plus the
+Firebase credentials (`FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`,
+`FIREBASE_PRIVATE_KEY`) are mandatory in production (the compose file fails
+loudly if they're missing). LLM API keys (`OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`) and `BOOTSTRAP_ADMIN_EMAILS` are
+optional but required to use real providers.
 
 > **Postgres vs SQLite.** The containerized stack uses PostgreSQL + pgvector
 > for real embedding retrieval. Bare-metal dev uses SQLite with an honest
 > keyword-retrieval fallback (no fake embeddable tiers).
 
-### Windows: make sure Docker Redis owns port 6379
-
-A bare-metal install of "Redis for Windows" (e.g. the old 3.0.504 MS Open Tech
-build) may install a Windows **service called `Redis`** that binds `0.0.0.0:6379`
-*before* Docker. Connections to `localhost:6379` then silently reach that old
-server while the container's own published `6379` is shadowed. Symptoms: the
-app fails at startup with `unknown command 'HELLO'` (RESP3 handshake), or worse
-— with an older `redis` Python package it *silently talks to the wrong Redis*.
-
-The backend now guards against this: at startup `/health` it checks the version
-of the server that actually answers and refuses to talk to anything older than
-`REDIS_MIN_VERSION` (default `6.0.0`). Fix the underlying conflict once:
-
-```powershell
-# In an ADMIN PowerShell (one-time per machine):
-Stop-Service Redis -Force          # stop the stale Windows Redis service
-sc.exe config Redis start= disabled # prevent it from starting again
-netstat -ano | findstr :6379       # expect only the Docker port-proxy PID
-docker compose start redis         # container's published 6379 is now free
-```
-
-Prefer `redis://127.0.0.1:6379/0` for bare-metal dev (not `localhost`, which can
-resolve to `::1` and hit a stale server); inside Docker Compose use the network
-alias `redis://redis:6379/0`. See `backend/.env.example` for both modes.
+> **Rate limiting.** The distributed rate limiter runs on Cloud Firestore
+> (Firebase Admin SDK, server-side only) — there is no Redis. If Firestore is
+> unreachable mid-request the API fails closed with `503 rate_limit_unavailable`
+> rather than silently dropping limits. Without Firebase credentials (local
+> dev/tests) the limiter runs per-instance in memory.
 
 ## Configuration
 
@@ -129,7 +114,7 @@ Copy `backend/.env.example` to `backend/.env` and edit. Key settings:
 
 | Variable | Meaning |
 |---|---|
-| `APP_ENV` | `development` or `production`. Production requires `SECRET_KEY`, PostgreSQL, `REDIS_URL`. |
+| `APP_ENV` | `development` or `production`. Production requires `SECRET_KEY`, PostgreSQL, and Firebase credentials. |
 | `ASYNC_DATABASE_URL` | SQLAlchemy async URL. `sqlite+aiosqlite:///./oracle.db` (dev) or `postgresql+asyncpg://...` (prod). |
 | `SYNC_DATABASE_URL` | Symmetric sync URL used by Alembic (psycopg2 for Postgres). |
 | `ATTACKER_PROVIDER` / `ATTACKER_MODEL` | Attacker agent. `litellm` for real LLMs, `mock` for deterministic runs. |
@@ -140,8 +125,8 @@ Copy `backend/.env.example` to `backend/.env` and edit. Key settings:
 | `TRUSTED_PROXIES` | Comma-separated proxy IPs/CIDRs trusted to set `X-Forwarded-For` for rate limiting. Empty disables XFF trust. |
 | `BOOTSTRAP_ADMIN_EMAILS` | Emails promoted to `admin` on registration (admin user-management API). |
 | `ALLOW_REGISTRATION` | `true` allows self-registration; `false` makes `/auth/register` return 403 (admin-provisioned accounts only). |
-| `REDIS_URL` | Redis connection for the queue worker + distributed rate limiting (required in production). Bare-metal: `redis://127.0.0.1:6379/0` (Docker-published port); inside Docker Compose: `redis://redis:6379/0`. |
-| `REDIS_MIN_VERSION` | Minimum Redis server version accepted (startup fails fast if an older/other server answers — e.g. a stale Windows Redis shadowing the container). |
+| `FIREBASE_PROJECT_ID` | Firebase project id for the distributed rate limiter (required in production). |
+| `FIREBASE_CLIENT_EMAIL` / `FIREBASE_PRIVATE_KEY` | Service-account credentials (client email + PEM private key) for the Firebase Admin SDK. Set `FIRESTORE_EMULATOR_HOST` to point at the local emulator instead of Google. |
 
 ## Development commands
 
@@ -155,7 +140,7 @@ make typecheck   # mypy (app + benchmarks)
 make check       # lint + typecheck + test + benchmark  (== CI entrypoint)
 make benchmark   # reproducible benchmark -> benchmark-report.json
 make api         # uvicorn dev server with reload
-make worker      # Redis-backed campaign worker
+make worker      # PostgreSQL-backed campaign worker
 make migrate     # alembic upgrade head
 make compose-up  # full stack via docker compose
 ```
@@ -196,9 +181,9 @@ backend/app/            FastAPI application package (main.py, api/, core/, db/,
                         models/, schemas/, agents/, strategies/, services/, targets/)
 backend/alembic/        Migrations (Postgres-safe; SQLite-friendly env guards)
 backend/benchmarks/     Pure metric math + reproducible benchmark harness
-backend/tests/          34 test modules (205 tests), temp SQLite isolation
+backend/tests/          34 test modules (244 tests), temp SQLite isolation
 frontend/               Next.js 16 application
-docker-compose.yml      Full stack (db, redis, backend, worker, frontend)
+docker-compose.yml      Full stack (db, backend, worker, frontend)
 Makefile                Developer task runner
 docs/AUDIT.md           Audit + phase-log (E-01 … E-25 tracked here)
 ```

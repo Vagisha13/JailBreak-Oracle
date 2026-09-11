@@ -56,22 +56,23 @@ async def setup_test_database():
     original_enabled = settings.RATE_LIMIT_ENABLED
     settings.RATE_LIMIT_ENABLED = False
 
-    # The suite must never depend on (or churn connections against) a
-    # developer-local Redis; the shared limiter and queue fall back to their
-    # in-memory/in-process paths deterministically instead.
-    original_redis_url = settings.REDIS_URL
-    settings.REDIS_URL = None
+    # The suite must never depend on (or make network calls against) Firebase;
+    # without FIREBASE_* credentials the limiter runs its deterministic
+    # in-process path and reset_rate_limiter() below clears any cross-test state.
     reset_rate_limiter()
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Instantiate the ASGI middleware stack (rate-limit middleware included) so
+    # tests can reach the live middleware instance without issuing a request.
+    app.build_middleware_stack()
 
     yield
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
 
-    settings.REDIS_URL = original_redis_url
     settings.RATE_LIMIT_ENABLED = original_enabled
 
     if _test_db_dir is not None:

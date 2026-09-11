@@ -77,7 +77,8 @@
 ### Phase 8 — Production Hardening
 - [ ] Authentication middleware on protected routes
 - [ ] Rate limiting middleware
-- [ ] Redis job queue for background workers
+- [x] Redis job queue for background workers (superseded: durable PostgreSQL
+      `campaign_jobs` queue — Redis removed entirely)
 - [ ] Structured logging
 - [ ] Comprehensive error handling
 - [ ] API input validation refinements

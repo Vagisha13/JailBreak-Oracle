@@ -79,6 +79,14 @@ class Settings(BaseSettings):
     MAX_CAMPAIGN_COST: float = 50.0  # USD
     CAMPAIGN_TIMEOUT_SECONDS: int = 3600
 
+    # ── Durable campaign job queue (PostgreSQL) ───────────────
+    # A job is retried (with backoff) until it is terminal or it exhausts
+    # ``max_attempts``; a worker crash is never a permanent FAILED.
+    CAMPAIGN_JOB_MAX_ATTEMPTS: int = 3
+    # Base backoff (seconds) before a failed job may be claimed again; the delay
+    # grows linearly with the attempt number.
+    CAMPAIGN_JOB_RETRY_BACKOFF_SECONDS: float = 30.0
+
     # ── Rate Limiting ─────────────────────────────────────────
     RATE_LIMIT_ENABLED: bool = True
     RATE_LIMIT_PER_MINUTE: int = 60  # default bucket
@@ -91,17 +99,15 @@ class Settings(BaseSettings):
     # cannot spoof their way around per-IP buckets via the header.
     TRUSTED_PROXIES: str = ""
 
-    # ── Redis (job queue + distributed rate limiting) ─────────
-    REDIS_URL: Optional[str] = None
-    # After a Redis failure, back off this long before probing again. Keeps a
-    # dead Redis from slowing every request while it is down; during the backoff
-    # the app runs degraded (in-memory limiting / in-process queue).
-    REDIS_RETRY_SECONDS: float = 30.0
-    REDIS_CONNECT_TIMEOUT_SECONDS: float = 2.0
-    # Minimum Redis server version the application will talk to. The shared
-    # health probe fails fast when the responding server is older (e.g. a stale
-    # non-Docker "Redis for Windows" service shadowing the container's port).
-    REDIS_MIN_VERSION: str = "6.0.0"
+    # ── Firebase (Firestore distributed rate limiting; Redis replacement) ──
+    # The campaign job queue and every application table remain PostgreSQL; the
+    # Firebase Admin SDK + Cloud Firestore only run the shared API rate limiter.
+    # All three are required in production (validated at startup). In
+    # development/tests they are optional: without them the rate limiter runs
+    # per-instance (single-worker local dev only).
+    FIREBASE_PROJECT_ID: Optional[str] = None
+    FIREBASE_CLIENT_EMAIL: Optional[str] = None
+    FIREBASE_PRIVATE_KEY: Optional[str] = None
 
     # ── Target Agents (external LLM endpoints) ─────────────────
     # Types accepted by TargetProviderFactory.
@@ -159,6 +165,13 @@ class Settings(BaseSettings):
         return [h.strip().lower() for h in self.SSRF_ALLOW_PRIVATE_HOSTS.split(",") if h.strip()]
 
     @property
+    def firebase_configured(self) -> bool:
+        """True when all Firebase service-account credentials are present."""
+        return bool(
+            self.FIREBASE_PROJECT_ID and self.FIREBASE_CLIENT_EMAIL and self.FIREBASE_PRIVATE_KEY
+        )
+
+    @property
     def jwt_secret(self) -> str:
         """
         JWT signing secret.
@@ -183,16 +196,11 @@ class Settings(BaseSettings):
                 "Production requires a PostgreSQL ASYNC_DATABASE_URL "
                 "(SQLite is only supported for development/tests)."
             )
-        if not self.REDIS_URL:
+        if self.RATE_LIMIT_ENABLED and not self.firebase_configured:
             raise RuntimeError(
-                "REDIS_URL must be set in production (required for the campaign worker)."
-            )
-
-        redis_scheme = self.REDIS_URL.split(":", 1)[0]
-        if redis_scheme not in {"redis", "rediss"}:
-            raise RuntimeError(
-                f"REDIS_URL must start with redis:// or rediss:// "
-                f"(got scheme {redis_scheme!r})."
+                "Production requires Firebase credentials (FIREBASE_PROJECT_ID, "
+                "FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY) for the distributed "
+                "rate limiter (see .env.example)."
             )
 
 

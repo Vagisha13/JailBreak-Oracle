@@ -1,5 +1,5 @@
 """Campaign lifecycle tests: state transitions, failure handling, stale
-campaign recovery, and the Redis job queue round-trip.
+campaign recovery, and the durable PostgreSQL job queue round-trip.
 
 Unlike the API-level tests these exercise the worker/queue services directly
 with fully in-memory deterministic providers (no network).
@@ -9,15 +9,28 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import pytest_asyncio
 
 from sqlalchemy.future import select
 
-from app.core.config import settings
 from app.db.session import AsyncSessionLocal
-from app.models.domain import User, Project, Target, Experiment, Attack, Vulnerability
+from app.models.domain import (
+    User,
+    Project,
+    Target,
+    Experiment,
+    Attack,
+    Vulnerability,
+    CampaignJob,
+)
 from app.services.campaign import CampaignOrchestrator
 from app.services.memory import MemoryService
-from app.services.queue import enqueue_campaign, dequeue_campaign, JOB_QUEUE_KEY
+from app.services.queue import (
+    enqueue_campaign,
+    claim_next_job,
+    mark_job_completed,
+    JOB_COMPLETED,
+)
 from app.agents.attacker import AttackerAgent
 from app.agents.evaluator import EvaluatorAgent
 from app.targets.embeddings import MockEmbeddingProvider
@@ -28,6 +41,16 @@ from app.worker import (
     recover_stale_campaigns,
     PENDING_GRACE_SECONDS,
 )
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _empty_campaign_queue():
+    """Shared session-scoped DB: wipe the queue before each test so claims and
+    count assertions are deterministic (other modules enqueue too)."""
+    async with AsyncSessionLocal() as session:
+        await session.execute(CampaignJob.__table__.delete())
+        await session.commit()
+    yield
 
 
 class MockAttackerProvider(TargetProvider):
@@ -111,37 +134,6 @@ class HeartbeatRecorder:
                 )
             ).scalars().first()
             self.heartbeats.append(exp.heartbeat_at if exp else None)
-
-
-class FakeRedis:
-    """Minimal stand-in for the async Redis client used by the queue.
-
-    Mirrors real Redis semantics: values are stored as bytes and ``blpop``
-    returns ``(key, value_bytes)``.
-    """
-
-    def __init__(self):
-        self.list = []
-        self.counters = {}
-
-    async def rpush(self, key: str, value: str) -> int:
-        self.list.append((key, value.encode()))
-        return len(self.list)
-
-    async def blpop(self, key: str, timeout: int = 0):
-        if not self.list:
-            return None
-        return self.list.pop(0)
-
-    async def incr(self, key: str) -> int:
-        self.counters[key] = self.counters.get(key, 0) + 1
-        return self.counters[key]
-
-    async def expire(self, key: str, seconds: int) -> bool:
-        return True
-
-    async def ttl(self, key: str) -> int:
-        return 60
 
 
 async def _create_experiment(
@@ -393,7 +385,7 @@ async def test_heartbeat_bumped_during_and_after_campaign():
 
 
 @pytest.mark.asyncio
-async def test_pending_requeue_attempted_after_grace_period(monkeypatch):
+async def test_pending_requeue_attempted_after_grace_period():
     now = datetime.now(timezone.utc)
     experiment_id = await _create_experiment(
         name="Grace Pending", created_at=now - timedelta(seconds=PENDING_GRACE_SECONDS + 10)
@@ -405,30 +397,57 @@ async def test_pending_requeue_attempted_after_grace_period(monkeypatch):
         exp.status = "PENDING"
         await session.commit()
 
-    fake = FakeRedis()
-    monkeypatch.setattr(settings, "REDIS_URL", "redis://fake:6379")
-    monkeypatch.setattr("app.services.queue._redis_client", fake)
-    monkeypatch.setattr("app.services.queue._redis_attempted", True)
-
+    # Recovery re-enqueues a stale PENDING campaign onto the durable queue.
     result = await recover_stale_campaigns(max_age_seconds=3600, now=now)
     assert experiment_id in result["requeued"]
 
+    async with AsyncSessionLocal() as session:
+        from app.models.domain import CampaignJob
 
-@pytest.mark.asyncio
-async def test_queue_round_trip_with_fake_redis():
-    fake = FakeRedis()
-    exp_id = uuid.uuid4()
-
-    assert await enqueue_campaign(exp_id, redis_client=fake) is True
-    assert await enqueue_campaign(exp_id, redis_client=fake) is True
-
-    assert await dequeue_campaign(redis_client=fake, timeout=0) == exp_id
-    assert await dequeue_campaign(redis_client=fake, timeout=0) == exp_id
-    assert await dequeue_campaign(redis_client=fake, timeout=0) is None
+        job = (
+            await session.execute(
+                select(CampaignJob).where(CampaignJob.experiment_id == experiment_id)
+            )
+        ).scalars().first()
+        assert job is not None
+        assert job.status == "PENDING"
 
 
 @pytest.mark.asyncio
-async def test_invalid_job_payload_ignored():
-    fake = FakeRedis()
-    fake.list.append((JOB_QUEUE_KEY, b"not-a-uuid"))
-    assert await dequeue_campaign(redis_client=fake, timeout=0) is None
+async def test_enqueue_creates_claimable_pending_job():
+    """Enqueue persists a PENDING job that a worker can claim (and only once)."""
+    experiment_id = await _create_experiment(attack_budget=1)
+
+    assert await enqueue_campaign(experiment_id) is True
+    # Duplicate enqueue is idempotent — never two active jobs for one campaign.
+    assert await enqueue_campaign(experiment_id) is True
+
+    async with AsyncSessionLocal() as session:
+        from app.models.domain import CampaignJob
+
+        jobs = (
+            await session.execute(select(CampaignJob).where(CampaignJob.experiment_id == experiment_id))
+        ).scalars().all()
+        assert len(jobs) == 1
+        assert jobs[0].status == "PENDING"
+        assert jobs[0].attempts == 0
+
+    claimed = await claim_next_job()
+    assert claimed is not None
+    assert claimed.experiment_id == experiment_id
+    assert claimed.status == "RUNNING"
+    assert claimed.attempts == 1
+
+    # The claimed job is gone from the eligible set for any other worker.
+    second = await claim_next_job()
+    assert second is None
+
+    await mark_job_completed(claimed.id, status=JOB_COMPLETED)
+    async with AsyncSessionLocal() as session:
+        from app.models.domain import CampaignJob
+
+        job = (
+            await session.execute(select(CampaignJob).where(CampaignJob.id == claimed.id))
+        ).scalars().first()
+        assert job.status == "COMPLETED"
+        assert job.completed_at is not None

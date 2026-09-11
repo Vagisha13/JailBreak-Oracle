@@ -1,39 +1,54 @@
-"""Configurable API rate limiting.
+"""Configurable API rate limiting (Firestore-backed; Redis replacement).
 
-Supports two backends:
-  * In-memory sliding-window (default; used in development/test and as a
-    fail-open fallback when Redis is unreachable).
-  * Redis fixed-window counter (used when ``REDIS_URL`` is configured) so that
-    limits are shared across multiple application instances in production.
+The shared rate limiter runs on Cloud Firestore through the Firebase Admin SDK
+(server-side). PostgreSQL remains the system of record — Firestore stores only
+ephemeral rate-limit counters in the ``rate_limits`` collection.
 
-Redis is used only while the shared client (app.core.redis_client) reports it
-healthy. Any live failure trips the shared circuit breaker and the request is
-served from the in-memory backend — a Redis outage slows us down but never
-returns 500s. Clients may briefly exceed shared limits during a degradation;
-counter-side slack is the price of fail-open availability.
+Semantics preserved from the previous Redis implementation:
 
-Client identity trusts ``X-Forwarded-For`` ONLY for peers listed in
-``settings.TRUSTED_PROXIES`` (E-24). Without a configured proxy allowlist the
-raw socket peer is used and spoofed forwarded headers are ignored.
+  * limit / window   per-bucket per-window counts. Default bucket: 60/min;
+                     auth: 10/min; campaign writes: 5/min; llm (verify): 30/min.
+                     Window length: ``RATE_LIMIT_WINDOW_SECONDS`` (60s).
+  * key format       ``{bucket}:{client_ip}`` hashed to a Firestore document id
+                     ``rate_limits/{sha256 hash}``; the ``bucket`` field is kept
+                     for scoped resets.
+  * endpoint handling  ``_classify``: /auth -> auth, /vulnerabilities/verify ->
+                     llm, /campaigns writes -> campaign, everything else ->
+                     default. /health, /docs, /redoc, /openapi.json exempt.
+  * user/IP handling ``_client_ip`` honors X-Forwarded-For only when the direct
+                     peer is in ``settings.TRUSTED_PROXIES`` (E-24); otherwise
+                     the raw socket peer is used so headers cannot be spoofed.
+  * headers         429 + ``Retry-After`` with a JSON body carrying
+                     ``code: "rate_limit_exceeded"`` and ``retry_after``.
 
-Health checks and other cheap/no-risk endpoints are never rate-limited.
+Concurrency: every increment is a Firestore transaction (read latest counter,
+increment, write). The transaction's optimistic-concurrency retry makes racing
+requests safe, and the window reset (expired ``window_start`` -> fresh window)
+is atomic under concurrency. No read-in-Python-write race exists.
+
+Failure behavior: if Firestore is unreachable mid-request the request FAILS
+CLOSED with a 503 ``rate_limit_unavailable`` — the distributed limiter is the
+only enforcement, so an outage must never silently drop rate limiting. (The
+previous Redis backend failed open to in-memory; that degraded mode is gone.)
+
+Development/test default: when Firebase credentials are absent the limiter runs
+per-instance in memory (single-process local dev only). Production configuration
+is enforced at startup (see ``Settings.validate_critical_secrets``).
 """
 import asyncio
 import ipaddress
 import json
+import threading
 import time
-from typing import Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
-from app.core.redis_client import (
-    circuit_open,
-    forget_cached_client,
-    get_redis_client,
-    is_redis_configured,
-)
+from app.core.logging import get_logger
+
+logger = get_logger("ratelimit")
 
 # Public paths that are intentionally exempt from rate limiting.
 _RATE_LIMIT_EXEMPT_PREFIXES = ("/health", "/docs", "/redoc", "/openapi.json")
@@ -41,81 +56,124 @@ _RATE_LIMIT_EXEMPT_PREFIXES = ("/health", "/docs", "/redoc", "/openapi.json")
 _active_limiter: dict = {"memory": None, "middleware": None}
 
 
+class RateLimitUnavailableError(RuntimeError):
+    """Raised when the shared (Firestore) rate limiter cannot be reached.
+
+    The middleware converts this to a fail-closed 503 — never a silent
+    degraded-mode pass through.
+    """
+
+
 class InMemoryRateLimiter:
-    """Thread-safe-enough sliding window limiter for a single instance."""
+    """Fixed-window per-instance limiter used only when Firebase is not
+    configured (single-process development/tests). Same fixed-window semantics
+    as the Firestore limiter."""
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._hits: dict = {}
 
     async def check(self, key: str, limit: int, window: int) -> Tuple[bool, Optional[int]]:
         now = time.monotonic()
-        timestamps = [t for t in self._hits.get(key, []) if now - t < window]
-        if len(timestamps) >= limit:
-            self._hits[key] = timestamps
-            oldest = timestamps[0]
-            retry_after = max(1, int(window - (now - oldest)))
-            return False, retry_after
-        timestamps.append(now)
-        self._hits[key] = timestamps
-        return True, None
+        with self._lock:
+            entry = self._hits.get(key)
+            current = entry[0] if entry else 0
+            window_start = entry[1] if entry else now
+            if now - window_start >= window:
+                current = 0
+                window_start = now
+            if current >= limit:
+                return False, max(1, int(window - (now - window_start)))
+            self._hits[key] = (current + 1, window_start)
+            return True, None
 
     def reset(self) -> None:
-        self._hits.clear()
+        with self._lock:
+            self._hits.clear()
 
 
-class RedisRateLimiter:
-    """Fixed-window Redis-backed limiter shared across instances.
+class FirestoreRateLimiter:
+    """Fixed-window shared limiter on Cloud Firestore.
 
-    ``check`` returns ``None`` instead of raising when Redis fails mid-request;
-    the middleware treats that as "degrade this request to in-memory".
+    ``store`` exposes a concurrency-safe ``run_transaction(fn)``: for the real
+    adapter this is a Cloud Firestore transaction (atomic read-modify-write with
+    optimistic-concurrency retry); for tests it is an in-process stand-in with
+    the same guarantees.
     """
 
-    def __init__(self, redis_client) -> None:
-        self.redis = redis_client
-        self._prefix = "oracle:ratelimit:"
+    def __init__(self, store: Any, window: int, bucket: str) -> None:
+        self._store = store
+        self._window = window
+        self._bucket = bucket
 
-    async def check(self, key: str, limit: int, window: int) -> Optional[Tuple[bool, Optional[int]]]:
-        redis_key = f"{self._prefix}{key}"
-        try:
-            count = await self.redis.incr(redis_key)
-            if count == 1:
-                await self.redis.expire(redis_key, window)
+    async def check(self, key: str, limit: int, window: int) -> Tuple[bool, Optional[int]]:
+        from app.core.firestore_store import doc_id_for
+
+        doc_id = doc_id_for(self._bucket, key)
+
+        def _compute(txn: Any) -> Tuple[bool, Optional[int]]:
+            data = txn.get(doc_id) or {"count": 0, "window_start": 0}
+            now = time.time()
+            count = int(data["count"]) + 1
+            window_start = float(data["window_start"])
+            expired = now - window_start >= window
+            if expired:
+                window_start = now
+                count = 1
+            txn.set(
+                doc_id,
+                {
+                    "count": count,
+                    "window_start": window_start,
+                    "expires_at": window_start + window,
+                    "bucket": self._bucket,
+                },
+            )
             if count > limit:
-                ttl = await self.redis.ttl(redis_key)
-                return False, max(1, int(ttl) if ttl and ttl > 0 else 1)
+                return False, max(1, int(window_start + window - now))
             return True, None
-        except Exception as exc:  # redis.exceptions.RedisError, ConnectionError, timeout...
-            from app.core.redis_client import trip_circuit
 
-            trip_circuit(type(exc).__name__)
-            return None
+        try:
+            return await asyncio.to_thread(self._store.run_transaction, _compute)
+        except RateLimitUnavailableError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Firestore rate limiter failed (failing closed)",
+                extra={"event_name": "ratelimit.firestore_error",
+                       "error_type": type(exc).__name__},
+            )
+            raise RateLimitUnavailableError(str(exc)) from exc
 
     async def reset_global(self) -> None:
-        """Drop every key this limiter owns (shared counters across instances)."""
-        try:
-            keys = [k async for k in self.redis.scan_iter(match=self._prefix + "*")]
-            if keys:
-                await self.redis.delete(*keys)
-        except Exception:
-            pass
+        await asyncio.to_thread(self._store.reset_all)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Applies per-bucket, per-client rate limits to API requests."""
 
-    def __init__(self, app) -> None:
+    def __init__(self, app, store_builder: Optional[Callable[[], Any]] = None) -> None:
         super().__init__(app)
-        self._redis_limiter: Optional[RedisRateLimiter] = None
         self._memory = InMemoryRateLimiter()
+        self._store_builder = store_builder
+        self._firestore_limiters: dict = {}
         _active_limiter["memory"] = self._memory
         _active_limiter["middleware"] = self
 
-    def _get_limiter(self):
-        if is_redis_configured():
-            if self._redis_limiter is None:
-                self._redis_limiter = RedisRateLimiter(get_redis_client())
-            return self._redis_limiter
-        return self._memory
+    def _get_limiter(self, bucket: str):
+        # Lazy: without Firebase configured (dev/tests) we run in memory.
+        if self._store_builder is None or not settings.firebase_configured:
+            return self._memory
+        if bucket in self._firestore_limiters:
+            return self._firestore_limiters[bucket]
+        store = self._store_builder()
+        if store is None:
+            raise RateLimitUnavailableError("Firestore is not available")
+        limiter = FirestoreRateLimiter(
+            store, window=settings.RATE_LIMIT_WINDOW_SECONDS, bucket=bucket
+        )
+        self._firestore_limiters[bucket] = limiter
+        return limiter
 
     @staticmethod
     def _classify(request: Request) -> Optional[Tuple[str, int]]:
@@ -184,14 +242,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if limit <= 0:
             return await call_next(request)
 
-        limiter = self._get_limiter()
-        key = f"{bucket}:{self._client_ip(request)}"
-        checked = await limiter.check(key, limit, settings.RATE_LIMIT_WINDOW_SECONDS)
+        try:
+            limiter = self._get_limiter(bucket)
+        except RateLimitUnavailableError:
+            return self._unavailable_response()
 
-        if checked is None and limiter is not self._memory:
-            # Redis failed mid-flight (circuit tripped). Fail open to memory for
-            # this request rather than 500ing the API.
-            checked = await self._memory.check(key, limit, settings.RATE_LIMIT_WINDOW_SECONDS)
+        key = f"{bucket}:{self._client_ip(request)}"
+        try:
+            checked = await limiter.check(key, limit, settings.RATE_LIMIT_WINDOW_SECONDS)
+        except RateLimitUnavailableError:
+            return self._unavailable_response()
 
         allowed, retry_after = checked
         if not allowed:
@@ -212,96 +272,55 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         return await call_next(request)
 
+    @staticmethod
+    def _unavailable_response() -> Response:
+        return Response(
+            status_code=503,
+            content=json.dumps(
+                {
+                    "detail": "Rate limiter unavailable. Please retry later.",
+                    "code": "rate_limit_unavailable",
+                }
+            ),
+            media_type="application/json",
+        )
+
     async def reset(self) -> None:
         """Reset counters on both backends (used by tests)."""
         self._memory.reset()
-        if self._redis_limiter is not None:
-            await self._redis_limiter.reset_global()
-            self._redis_limiter = None
+        for bucket, limiter in self._firestore_limiters.items():
+            if limiter is not None:
+                await limiter.reset_global()
+        self._firestore_limiters = {}
 
 
-def _flush_redis_rate_limit_keys() -> None:
-    """Synchronously delete every rate-limit counter key owned by Redis.
+def build_store() -> Any:
+    """Composition root for the Firestore rate-limit store.
 
-    Uses a short-lived sync client so the async limiter's lifecycle is
-    untouched. Safe to call from test helpers and admin utilities: when Redis
-    is unreachable the in-memory backend still governs the current request and
-    a later probe retrips the shared circuit. Best-effort by design.
+    Returns None (middleware keeps dev in-memory mode) when Firebase is not
+    configured; in production the configuration is enforced at startup, so a
+    None here means a genuine init problem and requests fail closed.
     """
-    url = settings.REDIS_URL
-    if not url:
-        return
-    try:
-        import redis as sync_redis  # sync driver ships with redis-py
+    from app.core.firebase import get_firestore
 
-        client = sync_redis.Redis.from_url(
-            url,
-            socket_connect_timeout=1.0,
-            socket_timeout=2.0,
-        )
-        try:
-            cursor = 0
-            while True:
-                cursor, keys = client.scan(cursor, match="oracle:ratelimit:*", count=200)
-                if keys:
-                    client.delete(*keys)
-                if cursor == 0:
-                    break
-        finally:
-            client.close()
-    except Exception:  # pragma: no cover - connectivity is best-effort here
-        pass
+    db = get_firestore()
+    if db is None:
+        return None
+    from app.core.firestore_store import FirestoreStore
 
-
-async def _aclose_client(client) -> None:
-    """Best-effort ``aclose`` so the coroutine runs under an active loop."""
-    try:
-        await client.aclose()
-    except Exception:  # pragma: no cover - loop may already be tearing down
-        pass
-
-
-def _dispose_redis_limiter() -> None:
-    """Drop the cached Redis limiter, closing its async client first.
-
-    redis.asyncio pools bind their connections to a specific event loop; the
-    test suite runs each async case in its own loop, so a stale client must be
-    closed (never garbage-collected) whenever limiter state is reset. Closing
-    is scheduled on the currently running loop when one exists.
-    """
-    middleware = _active_limiter.get("middleware")
-    if middleware is None:
-        return
-    limiter = getattr(middleware, "_redis_limiter", None)
-    if limiter is None:
-        return
-    middleware._redis_limiter = None
-    client = limiter.redis
-    if client is None:
-        return
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if loop is not None:
-        loop.create_task(_aclose_client(client))
+    return FirestoreStore(db)
 
 
 def reset_rate_limiter() -> None:
-    """Reset rate-limit state across every backend (tests/admin utilities).
-
-    Clears the in-memory counters, drops the middleware's cached Redis limiter
-    (closing its pooled connections), deletes the shared Redis counters, and
-    forgives the shared failure circuit so the next request re-probes Redis.
-    """
+    """Reset rate-limit state across every backend (tests/admin utilities)."""
     memory = _active_limiter.get("memory")
     if memory is not None and hasattr(memory, "reset"):
         memory.reset()
-    _dispose_redis_limiter()
-    _flush_redis_rate_limit_keys()
-    forget_cached_client()
-
-
-def circuit_open_state() -> bool:
-    """Expose the shared circuit state for diagnostics."""
-    return circuit_open()
+    middleware = _active_limiter.get("middleware")
+    if middleware is not None and hasattr(middleware, "reset"):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            loop.create_task(middleware.reset())

@@ -8,6 +8,7 @@ from app.models.domain import (
     Vulnerability,
     AgentRun,
     AttackMutation,
+    CampaignJob,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "Vulnerability",
     "AgentRun",
     "AttackMutation",
+    "CampaignJob",
 ]

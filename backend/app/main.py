@@ -10,8 +10,7 @@ from starlette.responses import JSONResponse
 from app.core.config import settings
 from app.core.errors import APIError
 from app.core.logging import get_logger
-from app.core.ratelimit import RateLimitMiddleware
-from app.core.redis_client import check_health as check_redis_health
+from app.core.ratelimit import RateLimitMiddleware, build_store
 from app.core.security import SecurityHeadersMiddleware
 from app.db.session import engine
 from app.db.base import Base
@@ -74,25 +73,11 @@ async def lifespan(app: FastAPI):
                 "dev database file to regenerate it."
             )
 
-    # Fail fast when Redis is unusable: the worker and shared rate limiting
-    # depend on it, and it is far easier to diagnose at startup than from a
-    # buried campaign failure logged later.
-    if settings.REDIS_URL:
-        health = await get_redis_health()
-        if health["available"]:
-            logger.info("Redis connectivity confirmed", extra={"event_name": "redis.health_ok"})
-        else:
-            reason = health.get("reason", "unknown")
-            raise RuntimeError(
-                f"REDIS_URL is configured but Redis is unusable ({reason}). "
-                "Fix REDIS_URL/Redis or remove REDIS_URL to run degraded."
-            )
+    # No Redis and no external dependency probes at startup: development runs,
+    # tests, and the worker all start without Redis/Firebase. Production
+    # configuration (PostgreSQL, Firebase credentials) is enforced earlier by
+    # settings.validate_critical_secrets().
     yield
-
-
-async def get_redis_health() -> dict:
-    """Probe the shared Redis client for the startup check and /health."""
-    return await check_redis_health()
 
 
 app = FastAPI(
@@ -105,7 +90,7 @@ app = FastAPI(
 # Middleware ordering (first added = innermost): CORS stays outermost so that
 # both proxied API responses and rate-limit responses carry CORS headers.
 app.add_middleware(SecurityHeadersMiddleware)
-app.add_middleware(RateLimitMiddleware)
+app.add_middleware(RateLimitMiddleware, store_builder=build_store)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
@@ -178,10 +163,12 @@ async def health_check():
 @app.get("/health/dependencies")
 async def health_dependencies():
     """Detailed dependency probe for dashboards / status pages."""
+    from app.core import firebase
+
     return {
         "status": "healthy",
         "dependencies": {
             "database": "ok",
-            "redis": await check_redis_health(),
+            "firebase": firebase.health(),
         },
     }

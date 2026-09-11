@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException
 
 from sqlalchemy.future import select
 from sqlalchemy import func
@@ -434,7 +434,6 @@ async def get_campaign_findings(
 @router.post("/start", response_model=CampaignResponse)
 async def start_campaign(
     request: CampaignStartRequest,
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     orchestrator: CampaignOrchestrator = Depends(get_orchestrator),
 ):
@@ -496,38 +495,29 @@ async def start_campaign(
         },
     )
 
-    # Persistent Redis-backed queue when available; in-process fallback in dev.
-    enqueued = await enqueue_campaign(experiment_id)
-
-    if enqueued:
-        message = "Campaign queued for execution."
-    elif settings.APP_ENV == "production":
-        # S3 requirement: in production a campaign must NOT silently run inside
-        # the API process. It is either on the Redis worker queue or visibly
-        # failed — never "started" in-memory where a crash would drop it.
-        await orchestrator.record_campaign_failure(
-            experiment_id, reason="queue_unavailable"
-        )
+    # Durable PostgreSQL queue (replaces the Redis list): the job survives
+    # worker crashes and retries are bounded. PostgreSQL is always present, so
+    # a queued campaign is never silently run in-process.
+    try:
+        await enqueue_campaign(experiment_id)
+    except Exception as exc:
         logger.error(
-            "Campaign could not be queued in production; marking failed",
+            "Failed to enqueue campaign",
             extra={
-                "event_name": "campaign.queue_unavailable",
+                "event_name": "campaign.enqueue_failed",
                 "campaign_id": str(experiment_id),
+                "error_type": type(exc).__name__,
             },
+            exc_info=True,
         )
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Campaign worker queue (Redis) is unavailable. The campaign was "
-                "not started; enable REDIS_URL to run campaigns in production."
-            ),
+            detail="Campaign worker queue (PostgreSQL) is unavailable; "
+            "the campaign was not queued. Check the database.",
         )
-    else:
-        background_tasks.add_task(orchestrator.run_attack_loop, experiment_id)
-        message = "Campaign started in process (Redis worker not configured)."
 
     return CampaignResponse(
         experiment_id=experiment_id,
         status="PENDING",
-        message=message,
+        message="Campaign queued for execution.",
     )
